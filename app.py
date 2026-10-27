@@ -23,7 +23,18 @@ def get_fixtures(code):
     fx = load_fixtures()
     if fx.empty:
         return fx
-    return fx[fx.Div == code].reset_index(drop=True)
+    fx = fx[fx.Div == code]
+    # garde uniquement les matchs pas encore joués
+    today = pd.Timestamp.today().normalize()
+    fx = fx[fx.Date.isna() | (fx.Date >= today)]
+    # exclut les matchs déjà présents dans l'historique (évite la fuite de données)
+    df = get_data(code)
+    played = set(zip(df.HomeTeam, df.AwayTeam, df.Date.dt.date))
+    keep = []
+    for h, a, d in zip(fx.HomeTeam, fx.AwayTeam, fx.Date):
+        dd = d.date() if pd.notna(d) else None
+        keep.append((h, a, dd) not in played)
+    return fx[keep].reset_index(drop=True)
 
 
 def compute_elo(df, k=20, home_adv=60):
@@ -67,7 +78,7 @@ def fmt_date(d):
     return d.strftime("%d/%m") if pd.notna(d) else "--/--"
 
 
-@st.cache_data(show_spinner="Backtest en cours (1 à 2 min)...")
+@st.cache_data(show_spinner="Backtest en cours (1 à 3 min)...")
 def backtest(code, n_test=100, step=20):
     df = get_data(code)
     start = len(df) - n_test
@@ -182,9 +193,9 @@ tab0, tab1, tab2, tab3 = st.tabs(
 
 with tab0:
     if fx.empty:
-        st.info("Aucun match à venir trouvé pour cette ligue (fixtures.csv ne "
-                "couvre que la semaine en cours, et peut être vide entre deux "
-                "journées). Utilise le mode Manuel.")
+        st.info("Aucun match à venir pour cette ligue : le fichier ne contient "
+                "que des matchs déjà joués, ou n'est pas encore mis à jour. "
+                "Utilise le mode Manuel dans la barre latérale.")
     else:
         scan = scan_fixtures(model, fx)
         if scan.empty:
@@ -209,12 +220,16 @@ with tab1:
         c3.metric("Les deux marquent", f"{r['btts']}%")
 
         st.subheader(f"{home} vs {away} : top 5 des scores exacts")
-        st.table(pd.DataFrame(r["top_scores"], columns=["Score", "Probabilité %"]))
+        top_df = pd.DataFrame(r["top_scores"], columns=["Score", "Probabilité %"])
+        st.table(top_df.style.format({"Probabilité %": "{:.1f}"}))
 
         g = M[:7, :7] * 100
         fig = px.imshow(g, text_auto=".1f", color_continuous_scale="Blues",
                         labels=dict(x=f"Buts {away}", y=f"Buts {home}", color="%"))
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"displayModeBar": False})
 
         st.subheader("Value bet (modèle vs cotes)")
         p = np.array([r["1"], r["X"], r["2"]]) / 100
@@ -222,11 +237,12 @@ with tab1:
         marge = q.sum() - 1
         q = q / q.sum()
         tab = pd.DataFrame({"Issue": ["1", "X", "2"],
-                            "Modèle %": (p * 100).round(1),
-                            "Bookmaker %": (q * 100).round(1),
-                            "Écart": ((p - q) * 100).round(1),
-                            "EV": (p * np.array([o1, oX, o2])).round(2)})
-        st.table(tab)
+                            "Modèle %": p * 100,
+                            "Bookmaker %": q * 100,
+                            "Écart": (p - q) * 100,
+                            "EV": p * np.array([o1, oX, o2])})
+        st.table(tab.style.format({"Modèle %": "{:.1f}", "Bookmaker %": "{:.1f}",
+                                   "Écart": "{:+.1f}", "EV": "{:.2f}"}))
         st.caption(f"Marge du bookmaker : {marge * 100:.1f}%. EV > 1.05 = valeur "
                    "potentielle, à confirmer avec le backtest.")
 
@@ -245,10 +261,11 @@ with tab2:
     st.dataframe(h2h(df, home, away), use_container_width=True)
 
 with tab3:
-    st.write("Teste le modèle sur les 100 derniers matchs, chaque prédiction "
+    st.write("Teste le modèle sur les derniers matchs, chaque prédiction "
              "n'utilisant que les matchs précédents.")
+    n_test = st.selectbox("Nombre de matchs testés", [100, 200, 300], index=0)
     if st.button("Lancer le backtest"):
-        b = backtest(code)
+        b = backtest(code, n_test=n_test)
         if not b:
             st.error("Pas assez de données.")
         else:
@@ -265,5 +282,7 @@ with tab3:
                 st.info(verdict)
             if b["roi"] is not None:
                 st.metric(f"ROI simulé ({b['bets']} paris, EV > 1.05)", f"{b['roi']:.1f}%")
-            st.caption("100 matchs, c'est peu : un ROI positif ici peut être de la "
-                       "chance. Relance sur plusieurs ligues.")
+            st.caption("Sur quelques dizaines de paris, le ROI varie énormément "
+                       "par pur hasard. Fie-toi d'abord au Brier : tant que celui "
+                       "du modèle n'est pas plus bas que celui des bookmakers, "
+                       "un ROI positif ne prouve rien.")
