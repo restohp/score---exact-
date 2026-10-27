@@ -1,19 +1,14 @@
-from __future__ import annotations
-
 import datetime as dt
 import os
 import time
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import requests
-
 from scipy.optimize import minimize
 from scipy.stats import poisson
 
-
-URL = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
+URL = "https://www.football-data.co.uk/mmz4281/{s}/{code}.csv"
 
 LEAGUES = {
     "E0": "Premier League",
@@ -36,17 +31,14 @@ LEAGUES = {
     "G1": "Super League Grece",
 }
 
-SHOT_COLS = ["HS", "AS", "HST", "AST"]
-
 KEEP = [
-    "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG",
+    "Date", "HomeTeam", "AwayTeam",
+    "FTHG", "FTAG", "AvgH", "AvgD", "AvgA",
     "B365H", "B365D", "B365A",
-    "AvgH", "AvgD", "AvgA",
-] + SHOT_COLS
+]
 
 
-def season_codes(n: int = 4):
-    """Codes Football-Data, par exemple 2627 pour 2026-2027."""
+def season_codes(n=5):
     today = dt.date.today()
     start = today.year if today.month >= 8 else today.year - 1
 
@@ -56,422 +48,322 @@ def season_codes(n: int = 4):
     ]
 
 
-def _read_csv(path_or_url):
-    return pd.read_csv(
-        path_or_url,
-        encoding="latin-1",
-        low_memory=False,
+def _load_csv(code, season, cache="data", refresh=False, refresh_hours=12):
+    os.makedirs(cache, exist_ok=True)
+
+    path = os.path.join(cache, f"{code}_{season}.csv")
+    stale = (
+        not os.path.exists(path)
+        or (
+            refresh
+            and time.time() - os.path.getmtime(path) > refresh_hours * 3600
+        )
     )
 
+    if stale:
+        try:
+            response = requests.get(
+                URL.format(s=season, code=code),
+                timeout=25,
+                headers={"User-Agent": "ScoreExactPro/1.0"},
+            )
+            response.raise_for_status()
 
-def load_league(
-    code: str,
-    n_seasons: int = 4,
-    cache: str = "data",
-) -> pd.DataFrame:
+            content = response.content
+            if b"<html" not in content[:500].lower() and len(content) > 100:
+                with open(path, "wb") as file:
+                    file.write(content)
 
-    os.makedirs(cache, exist_ok=True)
+        except requests.RequestException as error:
+            if not os.path.exists(path):
+                print(f"Échec {code}/{season}: {error}")
+
+    if not os.path.exists(path):
+        return None
+
+    try:
+        return pd.read_csv(path, encoding="latin-1", low_memory=False)
+    except Exception:
+        return None
+
+
+def load_league(code, n_seasons=5, cache="data"):
+    if code not in LEAGUES:
+        raise ValueError(f"Championnat inconnu : {code}")
+
     frames = []
 
     for k, season in enumerate(season_codes(n_seasons)):
-        path = os.path.join(cache, f"{code}_{season}.csv")
+        # Seule la saison courante est rafraîchie régulièrement.
+        raw = _load_csv(code, season, cache, refresh=(k == 0))
 
-        stale = k == 0 and (
-            not os.path.exists(path)
-            or time.time() - os.path.getmtime(path) > 43200
-        )
-
-        if stale or not os.path.exists(path):
-            try:
-                response = requests.get(
-                    URL.format(season=season, code=code),
-                    timeout=30,
-                )
-                response.raise_for_status()
-
-                # Évite de sauvegarder une page HTML comme fichier CSV.
-                if b"<html" in response.content[:500].lower():
-                    raise ValueError(
-                        "Le serveur a renvoyé une page HTML, pas un CSV."
-                    )
-
-                with open(path, "wb") as f:
-                    f.write(response.content)
-
-            except Exception as exc:
-                print(
-                    f"{code} {season}: "
-                    f"téléchargement impossible: {exc}"
-                )
-
-                if not os.path.exists(path):
-                    continue
-
-        try:
-            d = _read_csv(path)
-        except Exception as exc:
-            print(f"Lecture impossible {path}: {exc}")
+        if raw is None:
             continue
 
-        required = {
-            "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"
-        }
-
-        if not required.issubset(d.columns):
+        required = {"Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"}
+        if not required.issubset(raw.columns):
             continue
 
-        for col in KEEP:
-            if col not in d.columns:
-                d[col] = np.nan
+        for column in KEEP:
+            if column not in raw.columns:
+                raw[column] = np.nan
 
-        d = d[KEEP].copy()
-
-        d["Date"] = pd.to_datetime(
-            d["Date"],
-            dayfirst=True,
-            errors="coerce",
+        data = raw[KEEP].copy()
+        data["Date"] = pd.to_datetime(
+            data["Date"], dayfirst=True, errors="coerce"
         )
 
-        numeric_cols = [
-            "FTHG", "FTAG",
-            *SHOT_COLS,
-            "B365H", "B365D", "B365A",
-            "AvgH", "AvgD", "AvgA",
-        ]
-
-        for col in numeric_cols:
-            d[col] = pd.to_numeric(
-                d[col],
-                errors="coerce",
+        for column in KEEP[3:]:
+            data[column] = pd.to_numeric(
+                data[column], errors="coerce"
             )
 
-        d = d.dropna(
-            subset=[
-                "Date", "HomeTeam", "AwayTeam",
-                "FTHG", "FTAG",
-            ]
+        data = data.dropna(
+            subset=["Date", "HomeTeam", "AwayTeam"]
         )
-
-        d["FTHG"] = d["FTHG"].astype(int)
-        d["FTAG"] = d["FTAG"].astype(int)
-        d["League"] = code
-
-        frames.append(d)
+        data["League"] = code
+        frames.append(data)
 
     if not frames:
         raise RuntimeError(
-            f"Aucune donnée historique trouvée pour {code}. "
-            "Vérifie la connexion et le code du championnat."
+            "Aucune donnée trouvée. Vérifie Internet et le championnat."
         )
 
-    out = pd.concat(frames, ignore_index=True)
-
-    out = out.drop_duplicates(
-        subset=["Date", "HomeTeam", "AwayTeam"],
-        keep="last",
+    result = pd.concat(frames, ignore_index=True)
+    result = result.drop_duplicates(
+        ["Date", "HomeTeam", "AwayTeam"]
     )
 
-    return out.sort_values("Date").reset_index(drop=True)
+    return result.sort_values("Date").reset_index(drop=True)
+
+
+def valid_odds(row):
+    """Retourne les cotes 1/N/2 si elles sont valides."""
+
+    for columns in [
+        ("AvgH", "AvgD", "AvgA"),
+        ("B365H", "B365D", "B365A"),
+    ]:
+        values = pd.to_numeric(
+            pd.Series([row.get(c, np.nan) for c in columns]),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+
+        if np.isfinite(values).all() and (values > 1).all():
+            return tuple(map(float, values))
+
+    return None
+
+
+def market_probabilities(odds):
+    """Normalisation simple des probabilités implicites."""
+
+    odds = np.asarray(odds, dtype=float)
+
+    if odds.shape != (3,) or not np.isfinite(odds).all():
+        raise ValueError("Trois cotes valides sont nécessaires.")
+
+    if (odds <= 1).any():
+        raise ValueError("Chaque cote doit être supérieure à 1.")
+
+    probabilities = 1.0 / odds
+    return probabilities / probabilities.sum()
+
+
+def outcome_1x2(home_goals, away_goals):
+    if home_goals > away_goals:
+        return 0
+    if home_goals == away_goals:
+        return 1
+    return 2
+
+
+def probs_1x2(matrix):
+    return np.array([
+        np.tril(matrix, -1).sum(),
+        np.trace(matrix),
+        np.triu(matrix, 1).sum(),
+    ])
 
 
 class DixonColes:
-    """
-    Modèle Dixon-Coles avec pondération temporelle.
-
-    xi contrôle la décroissance de l'importance des matchs anciens.
-    rho corrige les probabilités de certains scores faibles.
-    """
-
-    def __init__(
-        self,
-        xi: float = 0.0018,
-        shots_w: float = 0.0,
-    ):
+    def __init__(self, xi=0.0018):
         self.xi = float(xi)
-        self.shots_w = float(shots_w)
 
-    def fit(
-        self,
-        df: pd.DataFrame,
-        ref_date: Optional[pd.Timestamp] = None,
-    ):
+    def fit(self, df, ref_date=None):
+        data = df.dropna(
+            subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]
+        ).copy()
 
-        required = {
-            "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"
-        }
-
-        missing = required - set(df.columns)
-
-        if missing:
+        if len(data) < 50:
             raise ValueError(
-                f"Colonnes manquantes: {sorted(missing)}"
+                "Moins de 50 matchs : historique insuffisant."
             )
 
-        d = (
-            df.dropna(subset=list(required))
-            .copy()
-            .sort_values("Date")
+        data["FTHG"] = data["FTHG"].astype(int)
+        data["FTAG"] = data["FTAG"].astype(int)
+
+        ref_date = pd.Timestamp(
+            ref_date if ref_date is not None else data["Date"].max()
         )
 
-        if len(d) < 30:
-            raise ValueError(
-                "Il faut au moins 30 matchs historiques."
-            )
-
-        ref_date = (
-            pd.Timestamp(ref_date)
-            if ref_date is not None
-            else d["Date"].max()
-        )
-
-        teams = sorted(
-            set(d.HomeTeam) | set(d.AwayTeam)
-        )
-
-        idx = {
-            team: i
-            for i, team in enumerate(teams)
-        }
-
-        h = d.HomeTeam.map(idx).to_numpy()
-        a = d.AwayTeam.map(idx).to_numpy()
-
-        hg = d.FTHG.to_numpy(dtype=int)
-        ag = d.FTAG.to_numpy(dtype=int)
-
-        days = (
-            (ref_date - d.Date)
-            .dt.days
-            .clip(lower=0)
-            .to_numpy()
-        )
-
-        weights = np.exp(-self.xi * days)
+        teams = sorted(set(data["HomeTeam"]) | set(data["AwayTeam"]))
+        index = {team: i for i, team in enumerate(teams)}
         n = len(teams)
 
-        m00 = (hg == 0) & (ag == 0)
-        m01 = (hg == 0) & (ag == 1)
-        m10 = (hg == 1) & (ag == 0)
-        m11 = (hg == 1) & (ag == 1)
+        home_idx = data["HomeTeam"].map(index).to_numpy()
+        away_idx = data["AwayTeam"].map(index).to_numpy()
 
-        def unpack(p):
-            # Centre les forces offensives pour éviter
-            # une indétermination dans le niveau général.
-            attack = p[:n] - p[:n].mean()
-            defence = p[n:2*n]
-            home_adv = p[2*n]
-            rho = p[2*n + 1]
+        home_goals = data["FTHG"].to_numpy()
+        away_goals = data["FTAG"].to_numpy()
 
-            return attack, defence, home_adv, rho
+        days = (
+            (ref_date - data["Date"]).dt.days.clip(lower=0).to_numpy()
+        )
+        weights = np.exp(-self.xi * days)
 
-        def nll(p):
-            attack, defence, home_adv, rho = unpack(p)
+        m00 = (home_goals == 0) & (away_goals == 0)
+        m01 = (home_goals == 0) & (away_goals == 1)
+        m10 = (home_goals == 1) & (away_goals == 0)
+        m11 = (home_goals == 1) & (away_goals == 1)
 
-            lh = np.exp(
-                np.clip(
-                    attack[h] + defence[a] + home_adv,
-                    -5,
-                    4,
-                )
+        def unpack(parameters):
+            attack = parameters[:n] - parameters[:n].mean()
+            defense = (
+                parameters[n:2 * n] - parameters[n:2 * n].mean()
             )
+            home_advantage = parameters[2 * n]
+            rho = parameters[2 * n + 1]
+            mu = parameters[2 * n + 2]  # niveau général des buts
 
-            la = np.exp(
-                np.clip(
-                    attack[a] + defence[h],
-                    -5,
-                    4,
-                )
-            )
+            return attack, defense, home_advantage, rho, mu
 
-            tau = np.ones(len(d), dtype=float)
+        def negative_log_likelihood(parameters):
+            attack, defense, home_advantage, rho, mu = unpack(parameters)
 
-            tau[m00] = (
-                1 - lh[m00] * la[m00] * rho
-            )
+            lam_home = np.exp(np.clip(
+                mu + attack[home_idx] + defense[away_idx] + home_advantage,
+                -5, 4,
+            ))
+            lam_away = np.exp(np.clip(
+                mu + attack[away_idx] + defense[home_idx],
+                -5, 4,
+            ))
 
-            tau[m01] = (
-                1 + lh[m01] * rho
-            )
-
-            tau[m10] = (
-                1 + la[m10] * rho
-            )
-
+            tau = np.ones(len(data))
+            tau[m00] = 1 - lam_home[m00] * lam_away[m00] * rho
+            tau[m01] = 1 + lam_home[m01] * rho
+            tau[m10] = 1 + lam_away[m10] * rho
             tau[m11] = 1 - rho
-
             tau = np.clip(tau, 1e-8, None)
 
-            # Les termes de factorielle sont constants
-            # par rapport aux paramètres et peuvent être omis.
-            ll = (
+            # Les factorielles sont constantes : inutiles pour l'optimisation.
+            likelihood = (
                 np.log(tau)
-                + hg * np.log(lh) - lh
-                + ag * np.log(la) - la
+                + home_goals * np.log(lam_home) - lam_home
+                + away_goals * np.log(lam_away) - lam_away
             )
 
-            return -float(np.sum(weights * ll))
+            penalty = 0.001 * np.square(parameters[:2 * n]).sum()
 
-        p0 = np.zeros(2*n + 2, dtype=float)
+            return -float(np.sum(weights * likelihood)) + penalty
 
-        p0[2*n] = 0.20
-        p0[2*n + 1] = -0.05
+        initial = np.zeros(2 * n + 3)
+        initial[2 * n] = 0.2
+        initial[2 * n + 1] = -0.05
+        initial[2 * n + 2] = 0.25
 
         bounds = (
-            [(None, None)] * (2*n + 1)
-            + [(-0.15, 0.15)]
+            [(None, None)] * (2 * n + 1)
+            + [(-0.25, 0.25)]
+            + [(None, None)]
         )
 
         result = minimize(
-            nll,
-            p0,
+            negative_log_likelihood,
+            initial,
             method="L-BFGS-B",
             bounds=bounds,
-            options={
-                "maxiter": 1500,
-                "ftol": 1e-9,
-            },
+            options={"maxiter": 1000},
         )
 
-        if not result.success and not np.isfinite(result.fun):
+        if not np.isfinite(result.fun):
             raise RuntimeError(
-                f"Échec de l'optimisation: {result.message}"
+                f"Échec du modèle : {result.message}"
             )
 
         self.teams = teams
-        self.idx = idx
-
+        self.idx = index
         (
-            self.attack,
-            self.defence,
-            self.home_adv,
+            self.att,
+            self.defense,
+            self.home,
             self.rho,
+            self.mu,
         ) = unpack(result.x)
-
-        self.fit_date = ref_date
-        self.optimization_ok = bool(result.success)
+        self.optimization_message = str(result.message)
 
         return self
 
-    def rates(self, home: str, away: str):
-        """Retourne les buts attendus domicile et extérieur."""
-
+    def rates(self, home, away):
         if home not in self.idx or away not in self.idx:
-            raise KeyError(
-                "Une équipe est absente de l'historique."
-            )
+            raise KeyError("Équipe inconnue dans l'historique.")
 
         i = self.idx[home]
         j = self.idx[away]
 
-        lh = float(
-            np.exp(
-                np.clip(
-                    self.attack[i]
-                    + self.defence[j]
-                    + self.home_adv,
-                    -5,
-                    4,
-                )
-            )
-        )
+        home_rate = np.exp(np.clip(
+            self.mu + self.att[i] + self.defense[j] + self.home,
+            -3, 3,
+        ))
+        away_rate = np.exp(np.clip(
+            self.mu + self.att[j] + self.defense[i],
+            -3, 3,
+        ))
 
-        la = float(
-            np.exp(
-                np.clip(
-                    self.attack[j]
-                    + self.defence[i],
-                    -5,
-                    4,
-                )
-            )
-        )
+        return float(home_rate), float(away_rate)
 
-        return lh, la
-
-    def score_matrix(
-        self,
-        home: str,
-        away: str,
-        max_goals: int = 8,
-    ):
-        """Calcule les probabilités de chaque score exact."""
-
-        lh, la = self.rates(home, away)
-
+    def score_matrix(self, home, away, max_goals=8):
+        home_rate, away_rate = self.rates(home, away)
         goals = np.arange(max_goals + 1)
 
         matrix = np.outer(
-            poisson.pmf(goals, lh),
-            poisson.pmf(goals, la),
+            poisson.pmf(goals, home_rate),
+            poisson.pmf(goals, away_rate),
         )
 
-        r = self.rho
-
+        rho = self.rho
         matrix[0, 0] *= max(
-            1 - lh * la * r,
-            1e-8,
+            1 - home_rate * away_rate * rho, 1e-8
         )
-
-        matrix[0, 1] *= max(
-            1 + lh * r,
-            1e-8,
-        )
-
-        matrix[1, 0] *= max(
-            1 + la * r,
-            1e-8,
-        )
-
-        matrix[1, 1] *= max(
-            1 - r,
-            1e-8,
-        )
+        matrix[0, 1] *= max(1 + home_rate * rho, 1e-8)
+        matrix[1, 0] *= max(1 + away_rate * rho, 1e-8)
+        matrix[1, 1] *= max(1 - rho, 1e-8)
 
         total = matrix.sum()
-
-        if not np.isfinite(total) or total <= 0:
-            raise RuntimeError(
-                "La matrice des scores est invalide."
-            )
+        if total <= 0:
+            raise RuntimeError("Matrice de scores invalide.")
 
         return matrix / total
 
-    @staticmethod
-    def probs_1x2(matrix):
-        """Probabilités victoire domicile, nul, victoire extérieur."""
-
-        return np.array([
-            np.tril(matrix, -1).sum(),
-            np.trace(matrix),
-            np.triu(matrix, 1).sum(),
-        ])
-
-    def summary(
-        self,
-        home: str,
-        away: str,
-        top: int = 5,
-    ):
-        """Résumé statistique d'un match."""
-
+    def summary(self, home, away, top=5):
         matrix = self.score_matrix(home, away)
-        lh, la = self.rates(home, away)
+        home_rate, away_rate = self.rates(home, away)
 
-        scores = sorted(
-            (
+        cells = sorted(
+            [
                 (i, j, matrix[i, j])
                 for i in range(matrix.shape[0])
                 for j in range(matrix.shape[1])
-            ),
-            key=lambda item: item[2],
-            reverse=True,
+            ],
+            key=lambda item: -item[2],
         )[:top]
 
         over25 = sum(
             matrix[i, j]
             for i in range(matrix.shape[0])
             for j in range(matrix.shape[1])
-            if i + j > 2
+            if i + j >= 3
         )
 
         btts = (
@@ -481,23 +373,15 @@ class DixonColes:
             + matrix[0, 0]
         )
 
-        p = self.probs_1x2(matrix)
-
         return {
-            "buts_attendus": (
-                round(lh, 2),
-                round(la, 2),
-            ),
+            "matrix": matrix,
+            "home_goals": home_rate,
+            "away_goals": away_rate,
             "top_scores": [
-                (
-                    f"{i}-{j}",
-                    round(prob * 100, 2),
-                )
-                for i, j, prob in scores
+                (f"{i}-{j}", float(probability * 100))
+                for i, j, probability in cells
             ],
-            "1": round(p[0] * 100, 2),
-            "X": round(p[1] * 100, 2),
-            "2": round(p[2] * 100, 2),
-            "over_2.5": round(over25 * 100, 2),
-            "btts": round(btts * 100, 2),
+            "p_1x2": probs_1x2(matrix),
+            "over25": float(over25 * 100),
+            "btts": float(btts * 100),
         }
