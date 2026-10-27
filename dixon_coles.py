@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import requests
 from scipy.optimize import minimize
-from scipy.special import gammaln
 from scipy.stats import poisson
 
 URL = "https://www.football-data.co.uk/mmz4281/{s}/{code}.csv"
@@ -20,8 +19,9 @@ LEAGUES = {
     "T1": "Super Lig", "G1": "Super League Grece",
 }
 
+SHOT_COLS = ["HS", "AS", "HST", "AST"]
 KEEP = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG",
-        "B365H", "B365D", "B365A", "AvgH", "AvgD", "AvgA"]
+        "B365H", "B365D", "B365A", "AvgH", "AvgD", "AvgA"] + SHOT_COLS
 
 
 def season_codes(n=4):
@@ -53,9 +53,12 @@ def load_league(code, n_seasons=4, cache="data"):
         except Exception:
             continue
         cols = [c for c in KEEP if c in d.columns]
-        d = d[cols].dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+        d = d[cols].dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
         d["Date"] = pd.to_datetime(d["Date"], dayfirst=True, errors="coerce")
         d = d.dropna(subset=["Date"])
+        for c in SHOT_COLS:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
         d["League"] = code
         frames.append(d)
     if not frames:
@@ -64,10 +67,38 @@ def load_league(code, n_seasons=4, cache="data"):
 
 
 class DixonColes:
-    """att = force d'attaque, dfn = faiblesse defensive (plus haut = encaisse plus)."""
+    """att = force d'attaque, dfn = faiblesse defensive (plus haut = encaisse plus).
 
-    def __init__(self, xi=0.0018):
-        self.xi = xi  # decroissance par jour (demi-vie ~ 1 an)
+    xi       : decroissance par jour (demi-vie ~ 1 an a 0.0018)
+    shots_w  : 0 = buts seuls, 1 = buts attendus estimes a partir des tirs,
+               entre les deux = melange
+    """
+
+    def __init__(self, xi=0.0018, shots_w=0.0):
+        self.xi = xi
+        self.shots_w = shots_w
+
+    @staticmethod
+    def _proxy(df):
+        """Buts attendus estimes depuis les tirs (regression sur le jeu d'entrainement)."""
+        if not all(c in df.columns for c in SHOT_COLS):
+            return None, None
+        hs, as_, hst, ast = (pd.to_numeric(df[c], errors="coerce").values
+                             for c in SHOT_COLS)
+        ok = ~(np.isnan(hs) | np.isnan(as_) | np.isnan(hst) | np.isnan(ast))
+        if ok.sum() < 100:
+            return None, None
+        X = np.concatenate([
+            np.column_stack([hst[ok], (hs - hst)[ok]]),
+            np.column_stack([ast[ok], (as_ - ast)[ok]]),
+        ])
+        y = np.concatenate([df.FTHG.values[ok].astype(float),
+                            df.FTAG.values[ok].astype(float)])
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        coef = np.clip(coef, 0, None)
+        ph = coef[0] * hst + coef[1] * (hs - hst)
+        pa = coef[0] * ast + coef[1] * (as_ - ast)
+        return ph, pa
 
     def fit(self, df, ref_date=None):
         ref_date = ref_date or df["Date"].max()
@@ -80,7 +111,16 @@ class DixonColes:
         ag = df.FTAG.values.astype(int)
         days = (ref_date - df["Date"]).dt.days.clip(lower=0).values
         w = np.exp(-self.xi * days)
-        lf = gammaln(hg + 1) + gammaln(ag + 1)
+
+        # cibles : buts reels, ou melange buts / buts estimes par les tirs
+        th, ta = hg.astype(float), ag.astype(float)
+        if self.shots_w > 0:
+            ph, pa = self._proxy(df)
+            if ph is not None:
+                sw = self.shots_w
+                th = np.where(np.isnan(ph), th, (1 - sw) * th + sw * ph)
+                ta = np.where(np.isnan(pa), ta, (1 - sw) * ta + sw * pa)
+
         m00 = (hg == 0) & (ag == 0)
         m01 = (hg == 0) & (ag == 1)
         m10 = (hg == 1) & (ag == 0)
@@ -100,8 +140,8 @@ class DixonColes:
             tau[m10] = 1 + la[m10] * rho
             tau[m11] = 1 - rho
             tau = np.clip(tau, 1e-6, None)
-            ll = (np.log(tau) + hg * np.log(lh) - lh
-                  + ag * np.log(la) - la - lf)
+            ll = (np.log(tau) + th * np.log(lh) - lh
+                  + ta * np.log(la) - la)
             return -(w * ll).sum()
 
         p0 = np.zeros(2 * n + 2)
