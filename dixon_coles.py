@@ -118,9 +118,12 @@ def load_league(code, n_seasons=5, cache="data"):
                 data[column], errors="coerce"
             )
 
+        # Garde seulement les matchs joués (score final connu).
         data = data.dropna(
-            subset=["Date", "HomeTeam", "AwayTeam"]
+            subset=["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"]
         )
+        data["FTHG"] = data["FTHG"].astype(int)
+        data["FTAG"] = data["FTAG"].astype(int)
         data["League"] = code
         frames.append(data)
 
@@ -189,6 +192,11 @@ def probs_1x2(matrix):
 class DixonColes:
     def __init__(self, xi=0.0018):
         self.xi = float(xi)
+
+    @staticmethod
+    def probs_1x2(matrix):
+        """Probabilités victoire domicile / nul / victoire extérieur."""
+        return probs_1x2(matrix)
 
     def fit(self, df, ref_date=None):
         data = df.dropna(
