@@ -9,10 +9,17 @@ st.set_page_config(page_title="Score Exact Pro", layout="wide")
 
 W_GRID = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
+VARIANTS = {
+    "Buts seuls": dict(xi=0.0018, shots_w=0.0),
+    "Mix 50% tirs": dict(xi=0.0018, shots_w=0.5),
+    "Tirs seuls": dict(xi=0.0018, shots_w=1.0),
+    "Mix 50% + oubli rapide": dict(xi=0.0035, shots_w=0.5),
+}
+
 
 @st.cache_data(ttl=43200, show_spinner="Chargement des données...")
 def get_data(code):
-    return load_league(code)
+    return load_league(code, n_seasons=4)
 
 
 @st.cache_resource(show_spinner="Calcul du modèle...")
@@ -117,49 +124,51 @@ def analyse(model, home, away, odds, w, top=5):
             "over25": over25 * 100, "btts": btts * 100}
 
 
-@st.cache_data(show_spinner="Backtest en cours (1 à 3 min)...")
-def backtest(code, n_test=100, step=20):
+@st.cache_data(show_spinner="Backtest en cours (3 à 6 min)...")
+def backtest(code, n_test=90, step=30):
     df = get_data(code)
     start = len(df) - n_test
-    rows = []
+    recs = []
     for s in range(0, n_test, step):
         chunk = df.iloc[start + s: start + s + step]
-        m = DixonColes().fit(df.iloc[:start + s], ref_date=chunk.Date.min())
+        ref = chunk.Date.min()
+        train = df.iloc[:start + s]
+        models = {name: DixonColes(**kw).fit(train, ref_date=ref)
+                  for name, kw in VARIANTS.items()}
+        first = next(iter(models.values()))
         for _, r in chunk.iterrows():
-            if r.HomeTeam not in m.idx or r.AwayTeam not in m.idx:
+            if r.HomeTeam not in first.idx or r.AwayTeam not in first.idx:
                 continue
             odds = np.array([r.get("AvgH", np.nan), r.get("AvgD", np.nan),
                              r.get("AvgA", np.nan)], dtype=float)
             if np.isnan(odds).any():
                 continue
-            M = m.score_matrix(r.HomeTeam, r.AwayTeam)
-            p = np.array(probs_1x2(M))
             q = 1 / odds
             q = q / q.sum()
             actual = 0 if r.FTHG > r.FTAG else 1 if r.FTHG == r.FTAG else 2
-            i, j = np.unravel_index(M.argmax(), M.shape)
-            rows.append({"p": p, "q": q, "odds": odds, "actual": actual,
-                         "exact_hit": bool(i == r.FTHG and j == r.FTAG)})
-    if not rows:
+            p = {name: np.array(probs_1x2(m.score_matrix(r.HomeTeam, r.AwayTeam)))
+                 for name, m in models.items()}
+            recs.append({"q": q, "actual": actual, "p": p})
+    if not recs:
         return None
     onehot = np.eye(3)
-    table = []
-    for w in W_GRID:
-        briers, profit, bets = [], 0.0, 0
-        for x in rows:
-            pb = w * x["p"] + (1 - w) * x["q"]
-            briers.append(((pb - onehot[x["actual"]]) ** 2).sum())
-            ev = pb * x["odds"]
-            k = int(ev.argmax())
-            if ev[k] > 1.05:
-                bets += 1
-                profit += (x["odds"][k] - 1) if x["actual"] == k else -1
-        table.append({"w": w, "brier": float(np.mean(briers)), "bets": bets,
-                      "roi": profit / bets * 100 if bets else None})
-    return {"n": len(rows),
-            "accuracy": float(np.mean([x["p"].argmax() == x["actual"] for x in rows])),
-            "exact": float(np.mean([x["exact_hit"] for x in rows])),
-            "table": table}
+    br_market = np.array([((x["q"] - onehot[x["actual"]]) ** 2).sum() for x in recs])
+    rows = []
+    for name in VARIANTS:
+        br_model = None
+        best = None
+        for w in W_GRID:
+            bw = np.array([((w * x["p"][name] + (1 - w) * x["q"]
+                             - onehot[x["actual"]]) ** 2).sum() for x in recs])
+            mean = float(bw.mean())
+            if w == 1.0:
+                br_model = mean
+            if best is None or mean < best["brier"]:
+                d = bw - br_market
+                se = float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else float("nan")
+                best = {"w": w, "brier": mean, "diff": float(d.mean()), "se": se}
+        rows.append({"name": name, "brier_model": br_model, **best})
+    return {"n": len(recs), "brier_market": float(br_market.mean()), "rows": rows}
 
 
 def scan_fixtures(model, fx, w):
@@ -320,38 +329,45 @@ with tab2:
     st.dataframe(h2h(df, home, away), use_container_width=True)
 
 with tab3:
-    st.write("Teste le modèle seul, le marché seul et plusieurs mélanges sur les "
-             "derniers matchs. Chaque prédiction n'utilise que les matchs précédents.")
-    n_test = st.selectbox("Nombre de matchs testés", [100, 200, 300], index=0)
+    st.write("Compare plusieurs versions du modèle (buts seuls, tirs, oubli rapide) "
+             "au marché, avec et sans mélange. Chaque prédiction n'utilise que les "
+             "matchs précédents.")
+    cov = (df[["HS", "HST"]].notna().all(axis=1).mean()
+           if all(c in df.columns for c in ("HS", "HST")) else 0.0)
+    st.caption(f"Matchs avec données de tirs : {cov:.0%}")
+    if cov < 0.5:
+        st.warning("Peu ou pas de données de tirs pour cette ligue : les variantes "
+                   "« tirs » seront presque identiques à « Buts seuls ».")
+    n_test = st.selectbox("Nombre de matchs testés", [90, 180, 300], index=0)
     if st.button("Lancer le backtest"):
         b = backtest(code, n_test=n_test)
         if not b:
             st.error("Pas assez de données avec cotes.")
         else:
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             c1.metric("Matchs testés", b["n"])
-            c2.metric("Précision 1X2 (modèle)", f"{b['accuracy'] * 100:.1f}%")
-            c3.metric("Score exact trouvé", f"{b['exact'] * 100:.1f}%")
+            c2.metric("Brier du marché", f"{b['brier_market']:.4f}")
 
-            t = pd.DataFrame(b["table"])
-            t["Poids du modèle"] = t["w"].map(
-                lambda x: "0 (marché seul)" if x == 0 else
-                ("1 (modèle seul)" if x == 1 else f"{x:.1f}"))
-            t = t.rename(columns={"brier": "Brier", "bets": "Paris", "roi": "ROI %"})
-            t = t[["Poids du modèle", "Brier", "Paris", "ROI %"]]
-            st.table(t.style.format({"Brier": "{:.4f}", "ROI %": "{:.1f}"},
-                                    na_rep="-"))
+            t = pd.DataFrame([{
+                "Variante": r["name"],
+                "Modèle seul": r["brier_model"],
+                "Meilleur poids": r["w"],
+                "Mélange": r["brier"],
+                "Écart vs marché": f"{r['diff']:+.4f} ± {r['se']:.4f}",
+            } for r in b["rows"]])
+            st.table(t.style.format({"Modèle seul": "{:.4f}", "Mélange": "{:.4f}",
+                                     "Meilleur poids": "{:.1f}"}))
 
-            mk = next(x for x in b["table"] if x["w"] == 0.0)
-            best = min(b["table"], key=lambda x: x["brier"])
-            if best["w"] > 0 and best["brier"] < mk["brier"] - 1e-9:
-                st.success(f"Meilleur mélange : {best['w']:.1f} de modèle, Brier "
-                           f"{best['brier']:.4f} contre {mk['brier']:.4f} pour le "
-                           "marché seul.")
+            wins = [r for r in b["rows"] if r["w"] > 0 and r["diff"] < -2 * r["se"]]
+            if wins:
+                names = ", ".join(r["name"] for r in wins)
+                st.success(f"Gain significatif face au marché : {names}. À vérifier "
+                           "sur d'autres ligues avant de t'y fier.")
             else:
-                st.warning("Aucun mélange ne fait mieux que le marché seul sur cet "
-                           "échantillon : le modèle n'apporte rien ici.")
-            st.caption("Plus le Brier est bas, mieux c'est. Le meilleur poids est "
-                       "choisi sur ces mêmes matchs, donc l'écart est optimiste : "
-                       "vérifie sur d'autres ligues avant de t'y fier. Le ROI sur "
-                       "quelques dizaines de paris ne prouve rien.")
+                st.warning("Aucune variante ne bat le marché de façon significative "
+                           "sur cet échantillon.")
+            st.caption("Brier : plus bas = mieux. « Écart vs marché » est négatif "
+                       "quand le mélange fait mieux que le marché ; il compte "
+                       "seulement s'il dépasse 2 fois l'erreur (±). Le meilleur "
+                       "poids est choisi sur ces mêmes matchs, donc l'écart reste "
+                       "optimiste.")
