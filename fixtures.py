@@ -4,6 +4,7 @@ import pandas as pd
 import requests
 
 URL = "https://www.football-data.co.uk/fixtures.csv"
+REQUIRED = ["Div", "HomeTeam", "AwayTeam"]
 
 
 def load_fixtures(cache="data"):
@@ -19,12 +20,25 @@ def load_fixtures(cache="data"):
             print(f"fixtures.csv: telechargement impossible ({e})")
     if not os.path.exists(path):
         return pd.DataFrame()
-    try:
-        d = pd.read_csv(path, encoding="latin-1")
-    except Exception:
+    d = None
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            d = pd.read_csv(path, encoding=enc)
+            break
+        except Exception:
+            continue
+    if d is None or d.empty:
         return pd.DataFrame()
-    d = d.dropna(subset=["Div", "HomeTeam", "AwayTeam"])
-    d["Date"] = pd.to_datetime(d["Date"], dayfirst=True, errors="coerce")
+    # nettoie les noms de colonnes (BOM, espaces)
+    d.columns = [str(c).replace("\ufeff", "").replace("ï»¿", "").strip()
+                 for c in d.columns]
+    if any(c not in d.columns for c in REQUIRED):
+        return pd.DataFrame()
+    d = d.dropna(subset=REQUIRED)
+    if "Date" in d.columns:
+        d["Date"] = pd.to_datetime(d["Date"], dayfirst=True, errors="coerce")
+    else:
+        d["Date"] = pd.NaT
     for c in ["B365H", "B365D", "B365A", "AvgH", "AvgD", "AvgA"]:
         if c not in d.columns:
             d[c] = np.nan
