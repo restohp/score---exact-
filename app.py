@@ -7,6 +7,8 @@ from fixtures import load_fixtures, get_odds
 
 st.set_page_config(page_title="Score Exact Pro", layout="wide")
 
+W_GRID = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
 
 @st.cache_data(ttl=43200, show_spinner="Chargement des données...")
 def get_data(code):
@@ -78,6 +80,43 @@ def fmt_date(d):
     return d.strftime("%d/%m") if pd.notna(d) else "--/--"
 
 
+def blend_probs(p_model, odds, w):
+    """Mélange modèle / marché. Sans cotes : modèle seul."""
+    if odds is None:
+        return p_model, None
+    q = 1 / np.array(odds, dtype=float)
+    q = q / q.sum()
+    return w * p_model + (1 - w) * q, q
+
+
+def adjust_matrix(M, p_target):
+    """Recale la matrice des scores pour que le 1X2 colle au mélange."""
+    p_model = np.array(probs_1x2(M))
+    f = p_target / np.clip(p_model, 1e-12, None)
+    idx = np.indices(M.shape)
+    i, j = idx[0], idx[1]
+    F = np.where(i > j, f[0], np.where(i == j, f[1], f[2]))
+    A = M * F
+    return A / A.sum()
+
+
+def analyse(model, home, away, odds, w, top=5):
+    M = model.score_matrix(home, away)
+    lh, la = model.rates(home, away)
+    p_model = np.array(probs_1x2(M))
+    p_blend, q = blend_probs(p_model, odds, w)
+    A = adjust_matrix(M, p_blend)
+    n = A.shape[0]
+    flat = sorted(((i, j, A[i, j]) for i in range(n) for j in range(n)),
+                  key=lambda x: -x[2])[:top]
+    over25 = sum(A[i, j] for i in range(n) for j in range(n) if i + j > 2)
+    btts = 1 - A[0, :].sum() - A[:, 0].sum() + A[0, 0]
+    return {"A": A, "lh": lh, "la": la, "p_model": p_model, "q": q,
+            "p_blend": p_blend,
+            "top": [(f"{i}-{j}", p * 100) for i, j, p in flat],
+            "over25": over25 * 100, "btts": btts * 100}
+
+
 @st.cache_data(show_spinner="Backtest en cours (1 à 3 min)...")
 def backtest(code, n_test=100, step=20):
     df = get_data(code)
@@ -89,61 +128,60 @@ def backtest(code, n_test=100, step=20):
         for _, r in chunk.iterrows():
             if r.HomeTeam not in m.idx or r.AwayTeam not in m.idx:
                 continue
-            M = m.score_matrix(r.HomeTeam, r.AwayTeam)
-            p = np.array(probs_1x2(M))
-            actual = 0 if r.FTHG > r.FTAG else 1 if r.FTHG == r.FTAG else 2
-            i, j = np.unravel_index(M.argmax(), M.shape)
             odds = np.array([r.get("AvgH", np.nan), r.get("AvgD", np.nan),
                              r.get("AvgA", np.nan)], dtype=float)
-            rows.append({"p": p, "actual": actual, "odds": odds,
-                         "exact_hit": (i == r.FTHG and j == r.FTAG)})
+            if np.isnan(odds).any():
+                continue
+            M = m.score_matrix(r.HomeTeam, r.AwayTeam)
+            p = np.array(probs_1x2(M))
+            q = 1 / odds
+            q = q / q.sum()
+            actual = 0 if r.FTHG > r.FTAG else 1 if r.FTHG == r.FTAG else 2
+            i, j = np.unravel_index(M.argmax(), M.shape)
+            rows.append({"p": p, "q": q, "odds": odds, "actual": actual,
+                         "exact_hit": bool(i == r.FTHG and j == r.FTAG)})
     if not rows:
         return None
-    onehot = lambda a: np.eye(3)[a]
-    brier = np.mean([((x["p"] - onehot(x["actual"])) ** 2).sum() for x in rows])
-    acc = np.mean([x["p"].argmax() == x["actual"] for x in rows])
-    exact = np.mean([x["exact_hit"] for x in rows])
-    out = {"n": len(rows), "brier": brier, "accuracy": acc, "exact": exact,
-           "brier_book": None, "roi": None, "bets": 0}
-    ok = [x for x in rows if not np.isnan(x["odds"]).any()]
-    if ok:
-        bb = []
-        for x in ok:
-            q = 1 / x["odds"]
-            q = q / q.sum()
-            bb.append(((q - onehot(x["actual"])) ** 2).sum())
-        out["brier_book"] = np.mean(bb)
-        profit, bets = 0.0, 0
-        for x in ok:
-            ev = x["p"] * x["odds"]
-            k = ev.argmax()
+    onehot = np.eye(3)
+    table = []
+    for w in W_GRID:
+        briers, profit, bets = [], 0.0, 0
+        for x in rows:
+            pb = w * x["p"] + (1 - w) * x["q"]
+            briers.append(((pb - onehot[x["actual"]]) ** 2).sum())
+            ev = pb * x["odds"]
+            k = int(ev.argmax())
             if ev[k] > 1.05:
                 bets += 1
                 profit += (x["odds"][k] - 1) if x["actual"] == k else -1
-        out["bets"] = bets
-        out["roi"] = profit / bets * 100 if bets else None
-    return out
+        table.append({"w": w, "brier": float(np.mean(briers)), "bets": bets,
+                      "roi": profit / bets * 100 if bets else None})
+    return {"n": len(rows),
+            "accuracy": float(np.mean([x["p"].argmax() == x["actual"] for x in rows])),
+            "exact": float(np.mean([x["exact_hit"] for x in rows])),
+            "table": table}
 
 
-def scan_fixtures(model, fx):
+def scan_fixtures(model, fx, w):
     rows = []
     for _, f in fx.iterrows():
         h, a = f.HomeTeam, f.AwayTeam
         if h not in model.idx or a not in model.idx:
             continue
-        r = model.summary(h, a, top=3)
         od = get_odds(f)
-        p = np.array([r["1"], r["X"], r["2"]]) / 100
+        res = analyse(model, h, a, od, w, top=3)
+        pb = res["p_blend"] * 100
         row = {"Date": fmt_date(f.Date), "Match": f"{h} - {a}",
-               "Buts att.": f"{r['buts_attendus'][0]}-{r['buts_attendus'][1]}",
-               "Score 1": f"{r['top_scores'][0][0]} ({r['top_scores'][0][1]}%)",
-               "Score 2": f"{r['top_scores'][1][0]} ({r['top_scores'][1][1]}%)",
-               "Score 3": f"{r['top_scores'][2][0]} ({r['top_scores'][2][1]}%)",
-               "1/X/2 %": f"{r['1']:.0f}/{r['X']:.0f}/{r['2']:.0f}",
-               "Over 2.5 %": r["over_2.5"], "BTTS %": r["btts"],
+               "Buts att.": f"{res['lh']:.2f}-{res['la']:.2f}",
+               "Score 1": f"{res['top'][0][0]} ({res['top'][0][1]:.1f}%)",
+               "Score 2": f"{res['top'][1][0]} ({res['top'][1][1]:.1f}%)",
+               "Score 3": f"{res['top'][2][0]} ({res['top'][2][1]:.1f}%)",
+               "1/X/2 %": f"{pb[0]:.0f}/{pb[1]:.0f}/{pb[2]:.0f}",
+               "Over 2.5 %": round(res["over25"], 1),
+               "BTTS %": round(res["btts"], 1),
                "Meilleur EV": np.nan, "Pari": "-", "Value": ""}
         if od:
-            ev = p * np.array(od)
+            ev = res["p_blend"] * np.array(od)
             k = int(ev.argmax())
             row["Meilleur EV"] = round(float(ev[k]), 2)
             row["Pari"] = ["1", "X", "2"][k]
@@ -167,6 +205,7 @@ mode = "Manuel"
 if not fx.empty:
     mode = st.sidebar.radio("Source du match", ["Matchs à venir", "Manuel"])
 
+odds_known = False
 if mode == "Matchs à venir":
     labels = [f"{fmt_date(r.Date)}  {r.HomeTeam} - {r.AwayTeam}"
               for r in fx.itertuples()]
@@ -177,6 +216,8 @@ if mode == "Matchs à venir":
     if od is None:
         st.sidebar.caption("Cotes indisponibles pour ce match : saisis-les à la main.")
         od = (2.00, 3.40, 3.60)
+    else:
+        odds_known = True
 else:
     home = st.sidebar.selectbox("Domicile", recent, index=0)
     away = st.sidebar.selectbox("Extérieur", recent, index=min(1, len(recent) - 1))
@@ -188,6 +229,14 @@ o1 = st.sidebar.number_input("Cote 1", 1.01, 100.0, float(od[0]), 0.05, key=f"o1
 oX = st.sidebar.number_input("Cote X", 1.01, 100.0, float(od[1]), 0.05, key=f"oX_{kk}")
 o2 = st.sidebar.number_input("Cote 2", 1.01, 100.0, float(od[2]), 0.05, key=f"o2_{kk}")
 
+use_odds = odds_known
+if not odds_known:
+    use_odds = st.sidebar.checkbox("J'ai saisi les vraies cotes ci-dessus",
+                                   value=False)
+
+w = st.sidebar.slider("Poids du modèle (0 = marché seul, 1 = modèle seul)",
+                      0.0, 1.0, 0.3, 0.1)
+
 tab0, tab1, tab2, tab3 = st.tabs(
     ["Matchs à venir", "Prédiction", "Forme & Elo", "Backtest"])
 
@@ -197,14 +246,14 @@ with tab0:
                 "que des matchs déjà joués, ou n'est pas encore mis à jour. "
                 "Utilise le mode Manuel dans la barre latérale.")
     else:
-        scan = scan_fixtures(model, fx)
+        scan = scan_fixtures(model, fx, w)
         if scan.empty:
             st.warning("Équipes absentes de l'historique (promus ?).")
         else:
             st.dataframe(scan.sort_values("Meilleur EV", ascending=False),
                          use_container_width=True, hide_index=True)
-            st.caption("Value = EV > 1.05 sur le 1X2. Un EV élevé peut aussi "
-                       "venir d'un modèle qui se trompe : valide avec le backtest.")
+            st.caption("Probabilités = mélange modèle/marché selon le poids "
+                       "choisi. Value = EV > 1.05 : valide d'abord avec le backtest.")
 
 with tab1:
     if home == away:
@@ -212,18 +261,25 @@ with tab1:
     elif home not in model.idx or away not in model.idx:
         st.warning("Une des équipes n'est pas dans l'historique (promu récent ?).")
     else:
-        M = model.score_matrix(home, away)
-        r = model.summary(home, away, top=5)
+        odds_arg = (o1, oX, o2) if use_odds else None
+        res = analyse(model, home, away, odds_arg, w)
         c1, c2, c3 = st.columns(3)
-        c1.metric("Buts attendus", f"{r['buts_attendus'][0]} - {r['buts_attendus'][1]}")
-        c2.metric("Over 2.5", f"{r['over_2.5']}%")
-        c3.metric("Les deux marquent", f"{r['btts']}%")
+        c1.metric("Buts attendus (modèle)", f"{res['lh']:.2f} - {res['la']:.2f}")
+        c2.metric("Over 2.5", f"{res['over25']:.1f}%")
+        c3.metric("Les deux marquent", f"{res['btts']:.1f}%")
+
+        if use_odds:
+            st.caption(f"Scores recalés sur un mélange {w:.0%} modèle / "
+                       f"{1 - w:.0%} marché.")
+        else:
+            st.caption("Modèle seul : entre les vraies cotes dans la barre "
+                       "latérale pour activer le mélange avec le marché.")
 
         st.subheader(f"{home} vs {away} : top 5 des scores exacts")
-        top_df = pd.DataFrame(r["top_scores"], columns=["Score", "Probabilité %"])
+        top_df = pd.DataFrame(res["top"], columns=["Score", "Probabilité %"])
         st.table(top_df.style.format({"Probabilité %": "{:.1f}"}))
 
-        g = M[:7, :7] * 100
+        g = res["A"][:7, :7] * 100
         fig = px.imshow(g, text_auto=".1f", color_continuous_scale="Blues",
                         labels=dict(x=f"Buts {away}", y=f"Buts {home}", color="%"))
         fig.update_xaxes(fixedrange=True)
@@ -231,20 +287,23 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True,
                         config={"displayModeBar": False})
 
-        st.subheader("Value bet (modèle vs cotes)")
-        p = np.array([r["1"], r["X"], r["2"]]) / 100
-        q = 1 / np.array([o1, oX, o2])
-        marge = q.sum() - 1
-        q = q / q.sum()
-        tab = pd.DataFrame({"Issue": ["1", "X", "2"],
-                            "Modèle %": p * 100,
-                            "Bookmaker %": q * 100,
-                            "Écart": (p - q) * 100,
-                            "EV": p * np.array([o1, oX, o2])})
-        st.table(tab.style.format({"Modèle %": "{:.1f}", "Bookmaker %": "{:.1f}",
-                                   "Écart": "{:+.1f}", "EV": "{:.2f}"}))
-        st.caption(f"Marge du bookmaker : {marge * 100:.1f}%. EV > 1.05 = valeur "
-                   "potentielle, à confirmer avec le backtest.")
+        st.subheader("Value bet")
+        if use_odds:
+            odds_np = np.array([o1, oX, o2])
+            marge = (1 / odds_np).sum() - 1
+            tab = pd.DataFrame({"Issue": ["1", "X", "2"],
+                                "Modèle %": res["p_model"] * 100,
+                                "Marché %": res["q"] * 100,
+                                "Mélange %": res["p_blend"] * 100,
+                                "EV": res["p_blend"] * odds_np})
+            st.table(tab.style.format({"Modèle %": "{:.1f}", "Marché %": "{:.1f}",
+                                       "Mélange %": "{:.1f}", "EV": "{:.2f}"}))
+            st.caption(f"Marge du bookmaker : {marge * 100:.1f}%. EV calculée avec "
+                       "les probabilités du mélange. EV > 1.05 = valeur potentielle, "
+                       "à confirmer avec le backtest.")
+        else:
+            st.info("Coche « J'ai saisi les vraies cotes » dans la barre latérale "
+                    "pour afficher la comparaison.")
 
 with tab2:
     elo = compute_elo(df)
@@ -261,28 +320,38 @@ with tab2:
     st.dataframe(h2h(df, home, away), use_container_width=True)
 
 with tab3:
-    st.write("Teste le modèle sur les derniers matchs, chaque prédiction "
-             "n'utilisant que les matchs précédents.")
+    st.write("Teste le modèle seul, le marché seul et plusieurs mélanges sur les "
+             "derniers matchs. Chaque prédiction n'utilise que les matchs précédents.")
     n_test = st.selectbox("Nombre de matchs testés", [100, 200, 300], index=0)
     if st.button("Lancer le backtest"):
         b = backtest(code, n_test=n_test)
         if not b:
-            st.error("Pas assez de données.")
+            st.error("Pas assez de données avec cotes.")
         else:
             c1, c2, c3 = st.columns(3)
             c1.metric("Matchs testés", b["n"])
-            c2.metric("Précision 1X2", f"{b['accuracy'] * 100:.1f}%")
+            c2.metric("Précision 1X2 (modèle)", f"{b['accuracy'] * 100:.1f}%")
             c3.metric("Score exact trouvé", f"{b['exact'] * 100:.1f}%")
-            c4, c5 = st.columns(2)
-            c4.metric("Brier modèle", f"{b['brier']:.3f}")
-            if b["brier_book"]:
-                c5.metric("Brier bookmakers", f"{b['brier_book']:.3f}")
-                verdict = ("Le modèle bat le marché" if b["brier"] < b["brier_book"]
-                           else "Les bookmakers restent meilleurs (plus bas = mieux)")
-                st.info(verdict)
-            if b["roi"] is not None:
-                st.metric(f"ROI simulé ({b['bets']} paris, EV > 1.05)", f"{b['roi']:.1f}%")
-            st.caption("Sur quelques dizaines de paris, le ROI varie énormément "
-                       "par pur hasard. Fie-toi d'abord au Brier : tant que celui "
-                       "du modèle n'est pas plus bas que celui des bookmakers, "
-                       "un ROI positif ne prouve rien.")
+
+            t = pd.DataFrame(b["table"])
+            t["Poids du modèle"] = t["w"].map(
+                lambda x: "0 (marché seul)" if x == 0 else
+                ("1 (modèle seul)" if x == 1 else f"{x:.1f}"))
+            t = t.rename(columns={"brier": "Brier", "bets": "Paris", "roi": "ROI %"})
+            t = t[["Poids du modèle", "Brier", "Paris", "ROI %"]]
+            st.table(t.style.format({"Brier": "{:.4f}", "ROI %": "{:.1f}"},
+                                    na_rep="-"))
+
+            mk = next(x for x in b["table"] if x["w"] == 0.0)
+            best = min(b["table"], key=lambda x: x["brier"])
+            if best["w"] > 0 and best["brier"] < mk["brier"] - 1e-9:
+                st.success(f"Meilleur mélange : {best['w']:.1f} de modèle, Brier "
+                           f"{best['brier']:.4f} contre {mk['brier']:.4f} pour le "
+                           "marché seul.")
+            else:
+                st.warning("Aucun mélange ne fait mieux que le marché seul sur cet "
+                           "échantillon : le modèle n'apporte rien ici.")
+            st.caption("Plus le Brier est bas, mieux c'est. Le meilleur poids est "
+                       "choisi sur ces mêmes matchs, donc l'écart est optimiste : "
+                       "vérifie sur d'autres ligues avant de t'y fier. Le ROI sur "
+                       "quelques dizaines de paris ne prouve rien.")
