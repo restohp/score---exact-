@@ -5,6 +5,7 @@ import plotly.express as px
 
 from dixon_coles import LEAGUES, load_league, DixonColes
 from fixtures import load_fixtures, get_odds
+import market_bias as mb
 
 st.set_page_config(page_title="Score Exact Pro", layout="wide")
 st.title("⚽ Score Exact Pro")
@@ -353,6 +354,12 @@ def run_backtest(code, n_test):
     return chronological_backtest(cached_data(code), n_test=n_test)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def run_market_bias(source):
+    matches = mb.load_all_odds(source, n_seasons=5)
+    return mb.analyse_bias(matches)
+
+
 # --------------------------------------------------
 # Configuration du championnat
 # --------------------------------------------------
@@ -503,11 +510,12 @@ model_weight = st.sidebar.slider(
 # Onglets
 # --------------------------------------------------
 
-tab0, tab1, tab2 = st.tabs(
+tab0, tab1, tab2, tab3 = st.tabs(
     [
         "Matchs à venir",
         "Prédiction",
         "Backtest indépendant",
+        "Biais du marché",
     ]
 )
 
@@ -845,4 +853,155 @@ with tab2:
                 "le poids sur les mêmes matchs. Il reste sensible "
                 "au championnat, aux cotes disponibles, à la qualité "
                 "des données et aux changements de saison."
+            )
+
+
+# --------------------------------------------------
+# Onglet 4 : biais du marché
+# --------------------------------------------------
+
+with tab3:
+    st.write(
+        "Question : parier systématiquement sur une catégorie de cotes "
+        "(favoris, nuls, outsiders), sans aucun modèle, rapporte-t-il plus "
+        "que la marge du bookmaker ne coûte ? Le test utilise tous les "
+        "championnats et 5 saisons. Les catégories positives sur la période "
+        "ancienne sont re-testées sur la période récente, avec un seuil "
+        "statistique relevé pour limiter les coïncidences."
+    )
+
+    source = st.selectbox(
+        "Cotes utilisées",
+        list(mb.ODDS_SOURCES),
+        index=0,
+    )
+
+    if source.startswith("Meilleure"):
+        st.caption(
+            "Les meilleures cotes de plusieurs bookmakers sont plus "
+            "favorables que celles d'un seul : un ROI meilleur est normal. "
+            "Elles ne sont pas toujours obtenables en pratique (limites de "
+            "mise, cotes périmées ou erronées)."
+        )
+
+    if st.button("Lancer l'analyse du biais du marché"):
+        with st.spinner(
+            "Téléchargement et calcul (1 à 3 min la première fois)..."
+        ):
+            try:
+                st.session_state["mb"] = (source, run_market_bias(source))
+            except Exception as exc:
+                st.session_state["mb"] = (
+                    source,
+                    {"error": f"L'analyse a échoué : {exc}"},
+                )
+
+    saved_mb = st.session_state.get("mb")
+
+    if saved_mb and saved_mb[0] == source:
+        bias = saved_mb[1]
+
+        if "error" in bias:
+            st.warning(bias["error"])
+
+        else:
+            overall = bias["overall"]
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric("Matchs analysés", f"{bias['n_matches']:,}".replace(",", " "))
+            c2.metric(
+                "Période",
+                f"{bias['date_min']:%m/%Y} – {bias['date_max']:%m/%Y}",
+            )
+            c3.metric(
+                "Séparation découverte / validation",
+                f"{bias['cutoff']:%d/%m/%Y}",
+            )
+
+            c4, c5, c6 = st.columns(3)
+
+            c4.metric(
+                "Tous les paris (ROI)",
+                f"{overall['all']['roi'] * 100:+.1f} %",
+            )
+            c5.metric(
+                "Favoris, cote < 2,00",
+                f"{overall['fav']['roi'] * 100:+.1f} %",
+            )
+            c6.metric(
+                "Outsiders, cote ≥ 5,00",
+                f"{overall['out']['roi'] * 100:+.1f} %",
+            )
+
+            level, message = mb.verdict(bias)
+
+            if level == "confirmed":
+                st.success(message)
+            else:
+                st.info(message)
+
+            st.subheader("ROI par tranche de cotes")
+
+            st.plotly_chart(
+                mb.bias_figure(bias),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            st.caption(
+                "Les barres d'erreur sont des intervalles de confiance à "
+                "95 %. La ligne pointillée est la perte attendue si le "
+                "marché est juste (la marge du bookmaker)."
+            )
+
+            st.subheader("Détail par type de pari")
+
+            detail = mb.display_table(bias)
+
+            st.dataframe(
+                detail.style.format(
+                    {
+                        "ROI valid. (%)": "{:+.1f}",
+                        "± IC 95 % (%)": "{:.1f}",
+                        "Paris (valid.)": "{:.0f}",
+                        "ROI découv. (%)": "{:+.1f}",
+                        "Paris (découv.)": "{:.0f}",
+                        "Gagné (%)": "{:.1f}",
+                        "Proba marché (%)": "{:.1f}",
+                        "ROI si marché juste (%)": "{:+.1f}",
+                    },
+                    na_rep="—",
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.subheader("Par championnat")
+
+            league = bias["league"].copy()
+            league["League"] = league["League"].map(
+                lambda c: LEAGUES.get(c, c)
+            )
+            league = league.rename(columns={"League": "Championnat"})
+
+            st.dataframe(
+                league.style.format(
+                    {
+                        "Marge effective (%)": "{:.1f}",
+                        "ROI pari aveugle (%)": "{:+.1f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(
+                "Lecture : un « Candidat non confirmé » était positif sur "
+                "la période ancienne mais pas de façon fiable sur la période "
+                "récente, ce qui est le résultat attendu d'un simple hasard. "
+                "Les cotes viennent de football-data.co.uk, avant le match "
+                "(ou à la clôture selon ton choix) ; elles ne contiennent "
+                "ni frais ni limites de mise. Le test ne couvre que le "
+                "1X2, pas le score exact."
             )
