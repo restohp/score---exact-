@@ -4,7 +4,8 @@ Design original : pas de logos ni d'écussons de clubs (droits des marques).
 Chaque match montre le score (ou « VS »), et trois étiquettes tirées du modèle :
   - buts : « +1,5 BUT » ou « -1,5 BUT » ;
   - résultat : 1, N ou 2 ;
-  - les deux équipes marquent : « GG » (oui) ou « NG » (non).
+  - les deux équipes marquent : « GG » (oui) ou « NG » (non) ;
+  - (matchs à venir) but en 1re mi-temps et but en 2e mi-temps, sur une 2e ligne.
 Couleurs : bleu = à venir, vert = validé, rouge = raté (après le match).
 """
 from __future__ import annotations
@@ -17,6 +18,9 @@ from PIL import Image, ImageDraw, ImageFont
 from dixon_coles import DixonColes
 
 W = 1080
+# Part des buts marqués en 1re mi-temps (moyenne observée dans les grands championnats :
+# environ 45 % en 1re mi-temps, 55 % en 2e). Approximation identique pour toutes les équipes.
+HALF_SHARE = 0.45
 BG = (15, 23, 42)
 CARD = (30, 41, 59)
 TXT = (241, 245, 249)
@@ -79,6 +83,17 @@ def _fit_lines(draw, text, max_w, start, minimum=28):
 # ----------------------------------------------------------------------
 # Calculs du modèle
 # ----------------------------------------------------------------------
+def half_goal_probs(model, home, away, share=HALF_SHARE):
+    """Probabilité qu'il y ait au moins un but en 1re puis en 2e mi-temps.
+
+    On répartit les buts attendus du match (45 % / 55 %) puis on suppose des buts
+    indépendants dans chaque mi-temps (loi de Poisson) : P(au moins un but) = 1 - exp(-λ).
+    """
+    lh, la = model.rates(home, away)
+    total = lh + la
+    return float(1 - np.exp(-share * total)), float(1 - np.exp(-(1 - share) * total))
+
+
 def build_match(model, home, away, league, date_str, hg=None, ag=None):
     """Étiquettes et probabilités d'un match, + validation si le score est connu."""
     m = model.score_matrix(home, away)
@@ -88,7 +103,10 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None):
     p_btts = float(1 - m[0, :].sum() - m[:, 0].sum() + m[0, 0])
     p1x2 = DixonColes.probs_1x2(m)
     pick = int(np.argmax(p1x2))
-    i, j = np.unravel_index(np.argmax(m), m.shape)
+    # score le plus probable PARMI ceux qui correspondent au pronostic 1/N/2
+    ii, jj = np.indices(m.shape)
+    mask = (ii > jj) if pick == 0 else ((ii == jj) if pick == 1 else (ii < jj))
+    i, j = np.unravel_index(np.argmax(np.where(mask, m, -1.0)), m.shape)
 
     played = hg is not None and ag is not None
     tags = []
@@ -116,9 +134,19 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None):
         "ok": ((hg > 0 and ag > 0) if gg else not (hg > 0 and ag > 0)) if played else None,
     })
 
+    half = []
+    if not played:
+        p1, p2 = half_goal_probs(model, home, away)
+        for p, lab in ((p1, "1re MT"), (p2, "2e MT")):
+            half.append({
+                "label": f"BUT {lab}" if p >= 0.5 else f"0 BUT {lab}",
+                "p": p if p >= 0.5 else 1 - p,
+                "ok": None,
+            })
+
     return {
         "league": league, "date": date_str, "home": home, "away": away,
-        "hg": hg, "ag": ag, "tags": tags, "score_pred": f"{i}-{j}",
+        "hg": hg, "ag": ag, "tags": tags, "half": half, "score_pred": f"{i}-{j}",
     }
 
 
@@ -126,6 +154,7 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None):
 # Dessin
 # ----------------------------------------------------------------------
 CARD_H = 560
+HALF_H = 140     # hauteur ajoutée par la 2e ligne d'étiquettes (mi-temps)
 
 
 def _initials(name):
@@ -137,9 +166,14 @@ def _color(name):
     return PALETTE[sum(ord(c) for c in name) % len(PALETTE)]
 
 
-def _draw_match(img, y, m, show_prob=True):
+def _card_height(m, show_half):
+    return CARD_H + (HALF_H if (show_half and m.get("half")) else 0)
+
+
+def _draw_match(img, y, m, show_prob=True, show_half=True):
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle([40, y, W - 40, y + CARD_H], radius=36, fill=CARD)
+    extra = _card_height(m, show_half) - CARD_H
+    d.rounded_rectangle([40, y, W - 40, y + CARD_H + extra], radius=36, fill=CARD)
     _text(d, (W // 2, y + 44), f"{m['league']} · {m['date']}", 30, MUTED)
 
     for cx, name in ((230, m["home"]), (850, m["away"])):
@@ -166,12 +200,23 @@ def _draw_match(img, y, m, show_prob=True):
             _text(d, (x + pill_w // 2, top + 88), f"{t['p'] * 100:.0f} %", 28, TXT)
         x += pill_w + gap
 
+    if extra:
+        pw = 450
+        x = (W - (2 * pw + gap)) // 2
+        top2 = top + 112 + 20
+        for t in m["half"]:
+            d.rounded_rectangle([x, top2, x + pw, top2 + 108], radius=26, fill=BLUE)
+            _text(d, (x + pw // 2, top2 + (40 if show_prob else 54)), t["label"], 44, TXT)
+            if show_prob:
+                _text(d, (x + pw // 2, top2 + 84), f"{t['p'] * 100:.0f} %", 28, TXT)
+            x += pw + gap
 
-def render_card(matches, title, signature="", show_prob=True):
+
+def render_card(matches, title, signature="", show_prob=True, show_half=True):
     """Image PNG (octets) avec 1 à 4 matchs empilés."""
     n = len(matches)
     head, foot = 170, 150
-    height = head + n * (CARD_H + 30) + foot
+    height = head + sum(_card_height(m, show_half) + 30 for m in matches) + foot
     img = Image.new("RGB", (W, height), BG)
     d = ImageDraw.Draw(img)
 
@@ -179,8 +224,10 @@ def render_card(matches, title, signature="", show_prob=True):
     for k, line in enumerate(lines):
         _text(d, (W // 2, 70 + k * (size + 6)), line, size, TXT)
 
-    for k, m in enumerate(matches):
-        _draw_match(img, head + k * (CARD_H + 30), m, show_prob)
+    y = head
+    for m in matches:
+        _draw_match(img, y, m, show_prob, show_half)
+        y += _card_height(m, show_half) + 30
 
     y = height - foot + 40
     _text(d, (W // 2, y), "Pronostics statistiques · aucun gain garanti · 18+", 26, MUTED)
