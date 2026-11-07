@@ -5,7 +5,8 @@ Chaque match montre le score (ou « VS »), et trois étiquettes tirées du mod�
   - buts : « +1,5 BUT » ou « -1,5 BUT » ;
   - résultat : 1, N ou 2 ;
   - les deux équipes marquent : « GG » (oui) ou « NG » (non) ;
-  - (si disponible) moyenne de buts marqués / encaissés de chaque équipe en 1re et 2e mi-temps.
+  - (si disponible) moyenne de buts marqués / encaissés de chaque équipe en 1re et 2e mi-temps ;
+  - (matchs à venir) score probable de chaque mi-temps, cohérent avec le score final probable.
 Couleurs : bleu = à venir, vert = validé, rouge = raté (après le match).
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from dixon_coles import DixonColes
 
 W = 1080
+HALF_SHARE = 0.45   # part des buts marquée en 1re mi-temps (moyenne des grands championnats)
 BG = (15, 23, 42)
 CARD = (30, 41, 59)
 PANEL = (44, 58, 82)
@@ -81,6 +83,31 @@ def _fit_lines(draw, text, max_w, start, minimum=28):
 # ----------------------------------------------------------------------
 # Calculs du modèle
 # ----------------------------------------------------------------------
+def _share(stats):
+    """Part des buts en 1re mi-temps : moyenne des deux équipes, ramenée vers 45 %
+    (20 « buts fictifs ») pour éviter les valeurs extrêmes sur 10 matchs."""
+    if not stats or not stats[0] or not stats[1]:
+        return HALF_SHARE
+    out = []
+    for st in stats:
+        g1 = st["n"] * (st["f1"] + st["a1"])
+        g2 = st["n"] * (st["f2"] + st["a2"])
+        out.append((g1 + HALF_SHARE * 20) / (g1 + g2 + 20))
+    return float(np.mean(out))
+
+
+def half_scores(i, j, share):
+    """Score probable de chaque mi-temps, sachant le score final probable i-j.
+
+    Chaque but tombe en 1re mi-temps avec probabilité `share` : le nombre de buts de la
+    1re mi-temps suit une loi binomiale, dont on prend la valeur la plus probable.
+    La 2e mi-temps est le reste, donc les deux scores s'additionnent toujours au score final.
+    """
+    h1 = min(int(np.floor((i + 1) * share)), i)
+    a1 = min(int(np.floor((j + 1) * share)), j)
+    return (h1, a1), (i - h1, j - a1)
+
+
 def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=None):
     """Étiquettes et probabilités d'un match, + validation si le score est connu.
 
@@ -128,6 +155,7 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=Non
         "league": league, "date": date_str, "home": home, "away": away,
         "hg": hg, "ag": ag, "tags": tags, "score_pred": f"{i}-{j}",
         "half": stats if (stats and stats[0] and stats[1]) else None,
+        "half_score": None if played else half_scores(int(i), int(j), _share(stats)),
     }
 
 
@@ -173,6 +201,10 @@ def _draw_match(img, y, m, show_prob=True, show_half=True):
     else:
         _text(d, (W // 2, y + 140), "VS", 96, MUTED)
         _text(d, (W // 2, y + 225), f"score probable {m['score_pred']}", 28, MUTED)
+        if m.get("half_score"):
+            (h1, a1), (h2, a2) = m["half_score"]
+            _text(d, (W // 2, y + 268), f"1re MT : {h1}-{a1}", 30, TXT)
+            _text(d, (W // 2, y + 306), f"2e MT : {h2}-{a2}", 30, TXT)
 
     pill_w, gap = 300, 20
     x = (W - (3 * pill_w + 2 * gap)) // 2
