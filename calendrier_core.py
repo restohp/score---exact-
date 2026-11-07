@@ -48,6 +48,16 @@ def _analyse(model, home, away):
     return p, f"{i}-{j}", float(matrix[i, j])
 
 
+HALF_SHARE = 0.45   # part des buts marqués en 1re mi-temps (approximation moyenne)
+
+
+def _half(model, home, away):
+    """(P but en 1re mi-temps, P but en 2e mi-temps), buts de Poisson indépendants."""
+    lh, la = model.rates(home, away)
+    t = lh + la
+    return float(1 - np.exp(-HALF_SHARE * t)), float(1 - np.exp(-(1 - HALF_SHARE) * t))
+
+
 def _row(code, name, status, date, home, away, model, odds, hg=None, ag=None):
     p, score, p_score = _analyse(model, home, away)
     market = dc.market_probabilities(odds) if odds else None
@@ -69,6 +79,7 @@ def _row(code, name, status, date, home, away, model, odds, hg=None, ag=None):
         "odds": odds,
         "score": score,
         "p_score": p_score,
+        "p_half": _half(model, home, away),
     }
 
 
@@ -157,6 +168,8 @@ def to_table(rows):
             "Cotes": (" / ".join(f"{o:.2f}" for o in r["odds"])
                       if r["odds"] else "—"),
             "Score probable": f"{r['score']} ({r['p_score'] * 100:.0f} %)",
+            "But 1re MT (%)": f"{r['p_half'][0] * 100:.0f}",
+            "But 2e MT (%)": f"{r['p_half'][1] * 100:.0f}",
             "Ligue": r["ligue"],
         })
     return pd.DataFrame(out)
