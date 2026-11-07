@@ -5,7 +5,7 @@ Chaque match montre le score (ou « VS »), et trois étiquettes tirées du mod�
   - buts : « +1,5 BUT » ou « -1,5 BUT » ;
   - résultat : 1, N ou 2 ;
   - les deux équipes marquent : « GG » (oui) ou « NG » (non) ;
-  - (matchs à venir) but en 1re mi-temps et but en 2e mi-temps, sur une 2e ligne.
+  - (si disponible) moyenne de buts marqués / encaissés de chaque équipe en 1re et 2e mi-temps.
 Couleurs : bleu = à venir, vert = validé, rouge = raté (après le match).
 """
 from __future__ import annotations
@@ -18,11 +18,9 @@ from PIL import Image, ImageDraw, ImageFont
 from dixon_coles import DixonColes
 
 W = 1080
-# Part des buts marqués en 1re mi-temps (moyenne observée dans les grands championnats :
-# environ 45 % en 1re mi-temps, 55 % en 2e). Approximation identique pour toutes les équipes.
-HALF_SHARE = 0.45
 BG = (15, 23, 42)
 CARD = (30, 41, 59)
+PANEL = (44, 58, 82)
 TXT = (241, 245, 249)
 MUTED = (148, 163, 184)
 BLUE = (59, 130, 246)
@@ -83,19 +81,11 @@ def _fit_lines(draw, text, max_w, start, minimum=28):
 # ----------------------------------------------------------------------
 # Calculs du modèle
 # ----------------------------------------------------------------------
-def half_goal_probs(model, home, away, share=HALF_SHARE):
-    """Probabilité qu'il y ait au moins un but en 1re puis en 2e mi-temps.
+def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=None):
+    """Étiquettes et probabilités d'un match, + validation si le score est connu.
 
-    On répartit les buts attendus du match (45 % / 55 %) puis on suppose des buts
-    indépendants dans chaque mi-temps (loi de Poisson) : P(au moins un but) = 1 - exp(-λ).
+    stats : (moyennes équipe domicile, moyennes équipe extérieur) par mi-temps, ou None.
     """
-    lh, la = model.rates(home, away)
-    total = lh + la
-    return float(1 - np.exp(-share * total)), float(1 - np.exp(-(1 - share) * total))
-
-
-def build_match(model, home, away, league, date_str, hg=None, ag=None):
-    """Étiquettes et probabilités d'un match, + validation si le score est connu."""
     m = model.score_matrix(home, away)
     n = m.shape[0]
     total_goals = np.add.outer(np.arange(n), np.arange(n))
@@ -134,19 +124,10 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None):
         "ok": ((hg > 0 and ag > 0) if gg else not (hg > 0 and ag > 0)) if played else None,
     })
 
-    half = []
-    if not played:
-        p1, p2 = half_goal_probs(model, home, away)
-        for p, lab in ((p1, "1re MT"), (p2, "2e MT")):
-            half.append({
-                "label": f"BUT {lab}" if p >= 0.5 else f"0 BUT {lab}",
-                "p": p if p >= 0.5 else 1 - p,
-                "ok": None,
-            })
-
     return {
         "league": league, "date": date_str, "home": home, "away": away,
-        "hg": hg, "ag": ag, "tags": tags, "half": half, "score_pred": f"{i}-{j}",
+        "hg": hg, "ag": ag, "tags": tags, "score_pred": f"{i}-{j}",
+        "half": stats if (stats and stats[0] and stats[1]) else None,
     }
 
 
@@ -154,7 +135,11 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None):
 # Dessin
 # ----------------------------------------------------------------------
 CARD_H = 560
-HALF_H = 140     # hauteur ajoutée par la 2e ligne d'étiquettes (mi-temps)
+HALF_H = 200     # hauteur ajoutée par le bloc « buts par mi-temps »
+
+
+def _fmt(x):
+    return f"{x:.2f}".replace(".", ",")
 
 
 def _initials(name):
@@ -204,12 +189,19 @@ def _draw_match(img, y, m, show_prob=True, show_half=True):
         pw = 450
         x = (W - (2 * pw + gap)) // 2
         top2 = top + 112 + 20
-        for t in m["half"]:
-            d.rounded_rectangle([x, top2, x + pw, top2 + 108], radius=26, fill=BLUE)
-            _text(d, (x + pw // 2, top2 + (40 if show_prob else 54)), t["label"], 44, TXT)
-            if show_prob:
-                _text(d, (x + pw // 2, top2 + 84), f"{t['p'] * 100:.0f} %", 28, TXT)
+        for name, st in zip((m["home"], m["away"]), m["half"]):
+            d.rounded_rectangle([x, top2, x + pw, top2 + 150], radius=26, fill=PANEL)
+            size = 30
+            while size > 20 and _width(d, name, size) > pw - 30:
+                size -= 2
+            _text(d, (x + pw // 2, top2 + 28), name, size, MUTED)
+            for k, (lab, f, a_) in enumerate((("1re MT", st["f1"], st["a1"]),
+                                              ("2e MT", st["f2"], st["a2"]))):
+                _text(d, (x + pw // 2, top2 + 78 + k * 44),
+                      f"{lab}   +{_fmt(f)} / -{_fmt(a_)}", 34, TXT)
             x += pw + gap
+        _text(d, (W // 2, top2 + 150 + 32),
+              "+ buts marqués · - buts encaissés, moyenne par match (10 derniers matchs)", 23, MUTED)
 
 
 def render_card(matches, title, signature="", show_prob=True, show_half=True):
