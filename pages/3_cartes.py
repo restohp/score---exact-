@@ -4,6 +4,7 @@ import streamlit as st
 import calendrier_core as cc
 import cartes_core as cr
 import dixon_coles as dc
+import half_stats as hs
 from dixon_coles import LEAGUES
 from fixtures import load_fixtures
 
@@ -12,7 +13,8 @@ st.set_page_config(page_title="Cartes pronostic", page_icon="🖼️", layout="w
 st.title("🖼️ Cartes pronostic")
 st.caption(
     "Crée une image à partager avec les matchs de ton choix : score ou « VS », "
-    "et trois étiquettes tirées du modèle (buts, résultat, les deux équipes marquent). "
+    "trois étiquettes tirées du modèle (buts, résultat, les deux équipes marquent) "
+    "et les moyennes de buts de chaque équipe par mi-temps. "
     "Bleu = à venir, vert = validé, rouge = raté (une fois le match joué)."
 )
 
@@ -23,6 +25,11 @@ today = pd.Timestamp.today().normalize()
 @st.cache_data(ttl=43200, show_spinner=False)
 def history(code):
     return dc.load_league(code, n_seasons=4)
+
+
+@st.cache_data(ttl=43200, show_spinner=False)
+def half_df(code):
+    return hs.load_half(code, n_seasons=2)
 
 
 @st.cache_resource(show_spinner=False)
@@ -102,6 +109,7 @@ choix = st.multiselect(
 title = st.text_input("Titre", value=f"Pronostics du {cc.fr_date(day_ts)}", key="car_title")
 signature = st.text_input("Ta signature (pseudo, optionnel)", value="", key="car_sig")
 show_prob = st.checkbox("Afficher les pourcentages", value=True, key="car_prob")
+show_half = st.checkbox("Afficher les buts par mi-temps", value=True, key="car_half")
 
 if st.button("Créer la carte", type="primary", use_container_width=True):
     if not choix:
@@ -112,11 +120,14 @@ if st.button("Créer la carte", type="primary", use_container_width=True):
             r = rows[labels.index(lab)]
             df = history(r["code"])
             model = model_for(r["code"], str(cc.cutoff_for(df, day_ts).date()))
+            hd = half_df(r["code"])
+            stats = (hs.averages(hd, r["home"], r["date"]),
+                     hs.averages(hd, r["away"], r["date"]))
             matches.append(cr.build_match(
                 model, r["home"], r["away"], r["ligue"], cc.fr_date(r["date"]),
-                r["hg"], r["ag"],
+                r["hg"], r["ag"], stats=stats,
             ))
-        st.session_state["car_png"] = cr.render_card(matches, title, signature, show_prob)
+        st.session_state["car_png"] = cr.render_card(matches, title, signature, show_prob, show_half)
 
 png = st.session_state.get("car_png")
 if png:
