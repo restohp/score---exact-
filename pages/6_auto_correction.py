@@ -11,9 +11,10 @@ st.set_page_config(page_title="Auto-correction", page_icon="🔁", layout="wide"
 st.title("🔁 Auto-correction des prédictions")
 st.caption(
     "L'appli refait des prédictions dans le passé (chaque match est prédit avec les seuls matchs "
-    "qui le précèdent), les compare aux vrais scores, repère où elle se trompe en moyenne "
-    "(trop de victoires à domicile, pas assez de nuls, trop de matchs à +1,5 but...) "
-    "et apprend une correction. La correction est jugée sur des matchs qu'elle n'a jamais vus. "
+    "qui le précèdent), les compare aux vrais scores finaux et aux scores de mi-temps, repère où "
+    "elle se trompe (en moyenne, équipe par équipe, mi-temps par mi-temps) et apprend des "
+    "corrections. Chaque correction est jugée sur des matchs qu'elle n'a jamais vus et n'est "
+    "utilisée sur les cartes que si elle améliore nettement le résultat. "
     "Les vrais scores viennent des fichiers football-data, mis à jour chaque jour."
 )
 
@@ -34,9 +35,15 @@ if st.session_state.get("ac_done") != code:
     st.stop()
 
 P = store.predictions(code)
-tab_match, tab_obs, tab_teams, tab_eval = st.tabs(
-    ["Match par match", "Où l'appli se trompe", "Équipes mal évaluées", "La correction aide-t-elle ?"]
+tab_match, tab_obs, tab_teams, tab_half, tab_eval = st.tabs(
+    ["Match par match", "Où l'appli se trompe", "Équipes mal évaluées", "Mi-temps",
+     "La correction aide-t-elle ?"]
 )
+
+
+def pct(s):
+    return (s * 100).round(1).astype(str) + " %"
+
 
 # ----------------------------------------------------------------------
 with tab_match:
@@ -50,8 +57,8 @@ with tab_match:
                "donne environ 33 %, et le favori des bookmakers environ 50 %.")
     n_show = st.slider("Nombre de matchs affichés", 10, 100, 40, 10, key="ac_n")
     st.dataframe(cb.review_table(P, n_show), hide_index=True, use_container_width=True)
-    st.caption("✔ = l'appli avait raison, ✘ = elle s'est trompée. Chaque prédiction n'utilise "
-               "que les matchs précédents.")
+    st.caption("✔ = l'appli avait raison, ✘ = elle s'est trompée. Pour les mi-temps, le score doit "
+               "être exact. Chaque prédiction n'utilise que les matchs précédents.")
 
 # ----------------------------------------------------------------------
 with tab_obs:
@@ -59,8 +66,8 @@ with tab_obs:
     st.caption(f"{n} matchs prédits dans le passé. « Prévu » = moyenne des probabilités de l'appli, "
                "« Réel » = fréquence observée.")
     show = table.copy()
-    show["Prévu"] = (show["Prévu"] * 100).round(1).astype(str) + " %"
-    show["Réel"] = (show["Réel"] * 100).round(1).astype(str) + " %"
+    show["Prévu"] = pct(show["Prévu"])
+    show["Réel"] = pct(show["Réel"])
     show["Écart (points)"] = show["Écart (points)"].round(1)
     st.dataframe(show, hide_index=True, use_container_width=True)
     st.caption("Écart positif = l'appli en prévoit trop ; négatif = pas assez.")
@@ -75,8 +82,8 @@ with tab_obs:
         "Les deux marquent": (P["pgg"], P["gg"]),
     }[choice]
     rel = cb.reliability(col, y)
-    rel["Prévu"] = (rel["prevu"] * 100).round(1).astype(str) + " %"
-    rel["Réel"] = (rel["reel"] * 100).round(1).astype(str) + " %"
+    rel["Prévu"] = pct(rel["prevu"])
+    rel["Réel"] = pct(rel["reel"])
     st.dataframe(rel[["Prévu", "Réel", "n"]].rename(columns={"n": "Matchs"}),
                  hide_index=True, use_container_width=True)
 
@@ -97,8 +104,52 @@ with tab_teams:
         st.dataframe(show, hide_index=True, use_container_width=True)
 
 # ----------------------------------------------------------------------
+with tab_half:
+    hh = cb.half_hit_rates(P)
+    if hh is None:
+        st.info("Ce championnat n'a pas assez de scores de mi-temps dans les fichiers gratuits.")
+    else:
+        table, n = hh
+        st.markdown("**Les scores de mi-temps prédits sur les cartes**")
+        st.caption(f"{n} matchs. Le score de chaque mi-temps est celui des cartes : déduit du "
+                   "score final probable et de la part de buts de chaque équipe en 1re mi-temps. "
+                   "« Toujours le même choix » = réussite si on répondait toujours le score "
+                   "(ou le résultat) le plus fréquent : c'est la barre à dépasser.")
+        show = table.copy()
+        show["Réussite de l'appli"] = pct(show["Réussite de l'appli"])
+        show["Toujours le même choix"] = pct(show["Toujours le même choix"])
+        st.dataframe(show, hide_index=True, use_container_width=True)
+
+        ev = cb.evaluate_half(P)
+        if ev is not None:
+            tab, s_lg, nb = ev
+            st.markdown("**Quelle part de buts en 1re mi-temps prédit le mieux ?**")
+            st.caption(f"Dans ce championnat, {cb.league_share(P):.1%} des buts tombent en 1re "
+                       f"mi-temps. Les trois méthodes sont jugées sur les {nb} matchs les plus "
+                       "récents (chiffres = log-loss des buts, plus petit = meilleur ; "
+                       "z sous -2 = amélioration nette contre la part fixe 45 %).")
+            show = tab.copy()
+            for c in show.columns[1:]:
+                show[c] = show[c].round(4) if not c.startswith("z") else show[c].round(2)
+            st.dataframe(show, hide_index=True, use_container_width=True)
+            best = []
+            for _, r in tab.iterrows():
+                if r["z par équipe"] < -2:
+                    best.append(f"{r['Mi-temps']} : la part par équipe (carte) est nettement meilleure")
+                elif r["z championnat"] < -2:
+                    best.append(f"{r['Mi-temps']} : la part du championnat est nettement meilleure")
+            if best:
+                st.success(" ; ".join(best) + ".")
+            else:
+                st.info("Aucune méthode ne bat nettement la part fixe de 45 % : les buts par "
+                        "mi-temps restent surtout du hasard.")
+            st.caption("Sur la carte, la case « Auto-correction » utilise la part réelle du "
+                       "championnat comme point de départ du score de chaque mi-temps.")
+
+# ----------------------------------------------------------------------
 with tab_eval:
     res, cal, vm, nb = cb.evaluate(P)
+    st.markdown("**Correction globale** (trop de victoires à domicile, pas assez de nuls...)")
     st.caption(f"La correction est apprise sur les 60 % de matchs les plus anciens, "
                f"puis jugée sur les {nb} matchs les plus récents.")
     show = res.copy()
@@ -111,10 +162,38 @@ with tab_eval:
 
     wins = [r["Marché"] for _, r in res.iterrows() if r["z (négatif = mieux)"] < -2]
     if wins:
-        st.success("La correction améliore nettement : " + ", ".join(wins) + ".")
+        st.success("La correction globale améliore nettement : " + ", ".join(wins) + ".")
     else:
-        st.info("Aucune amélioration nette sur ces matchs : la correction est inutile ici, "
+        st.info("Aucune amélioration nette sur ces matchs : la correction globale est inutile ici, "
                 "mais elle ne fait pas de mal non plus.")
+
+    # --- correction par équipe ---
+    st.markdown("**Correction équipe par équipe** (attaque et défense de chaque équipe)")
+    try:
+        tt, z_all, nt = cb.evaluate_team(P)
+        show = tt.copy()
+        for c in show.columns[1:5]:
+            show[c] = show[c].round(4)
+        show[show.columns[5]] = show[show.columns[5]].round(2)
+        st.dataframe(show, hide_index=True, use_container_width=True)
+        st.caption(f"Jugée sur les {nt} matchs les plus récents, avec des corrections apprises "
+                   "uniquement sur les 60 % les plus anciens. Chaque équipe est corrigée "
+                   "prudemment (ramenée vers « aucune correction » quand on la connaît peu). "
+                   "Dans la dernière colonne, un z sous -2 veut dire que la correction par "
+                   "équipe aide vraiment.")
+        if np.isfinite(z_all) and z_all < -2:
+            st.success(f"La correction par équipe améliore nettement l'ensemble des paris "
+                       f"(z global {z_all:.2f}) : elle est activée sur les cartes avec "
+                       "l'auto-correction.")
+        elif np.isfinite(z_all) and z_all > 2:
+            st.warning(f"La correction par équipe dégrade le résultat (z global {z_all:.2f}) : "
+                       "elle n'est pas utilisée. Les écarts par équipe vus plus haut ne se "
+                       "répètent pas assez d'un match à l'autre.")
+        else:
+            st.info(f"Pas de différence nette (z global {z_all:.2f}) : la correction par équipe "
+                    "n'est pas utilisée sur les cartes.")
+    except Exception as exc:
+        st.caption(f"Évaluation par équipe indisponible ({exc}).")
 
     if vm:
         st.markdown("**Comparaison avec le marché (résultat 1/N/2)**")
@@ -125,11 +204,18 @@ with tab_eval:
         st.caption("Même après correction, le marché reste la référence : il connaît les blessures "
                    "et les compositions, pas l'appli.")
 
-    st.markdown("**Correction apprise (sur tous les matchs)**")
-    full = cb.fit_calibration(P)
+    st.markdown("**Correction finale utilisée sur les cartes**")
+    full = store.calibration(code)
     a, bn, b2 = full["x12"]
     st.write(f"- 1/N/2 : température {a:.2f} (1 = aucune), biais sur le nul {bn:+.2f}, "
              f"sur la victoire extérieur {b2:+.2f}.")
     st.write(f"- +1,5 but : pente {full['o15'][0]:.2f}, décalage {full['o15'][1]:+.2f}.")
     st.write(f"- Les deux marquent : pente {full['gg'][0]:.2f}, décalage {full['gg'][1]:+.2f}.")
+    st.write(f"- Part des buts en 1re mi-temps : {full['share']:.1%}.")
+    if full.get("team"):
+        st.write("- Correction par équipe : activée. Équipes les plus modifiées (en % de buts) :")
+        ft = cb.team_factors_table(full["team"]).round(1)
+        st.dataframe(ft, hide_index=True, use_container_width=True)
+    else:
+        st.write("- Correction par équipe : non activée (elle n'a pas passé le test).")
     st.caption("Sur la page « cartes », la case « Auto-correction » applique cette correction.")
