@@ -1,12 +1,36 @@
+import importlib
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(page_title="Auto-correction", page_icon="🔁", layout="wide")
+
+# Vérification des fichiers : dit lequel est manquant ou ancien (au lieu d'une erreur obscure)
+_NEEDED = {
+    "ac_data": ["load_data", "oos_predictions", "league_share"],
+    "ac_fit": ["fit_full", "evaluate_team", "evaluate"],
+    "ac_review": ["review_table", "evaluate_half", "half_hit_rates"],
+    "calib_core": ["load_data", "fit_full", "review_table"],
+    "calib_store": ["predictions", "calibration"],
+}
+_problems = []
+for _mod, _names in _NEEDED.items():
+    try:
+        _m = importlib.import_module(_mod)
+    except Exception as _exc:
+        _problems.append(f"{_mod}.py : introuvable ou erreur ({_exc})")
+        continue
+    for _n in _names:
+        if not hasattr(_m, _n):
+            _problems.append(f"{_mod}.py : ancienne version (il manque « {_n} »)")
+if _problems:
+    st.error("Des fichiers sont à corriger sur GitHub (racine du dépôt) :\n\n- " + "\n- ".join(_problems))
+    st.stop()
+
 import calib_core as cb
 import calib_store as store
 from dixon_coles import LEAGUES
-
-st.set_page_config(page_title="Auto-correction", page_icon="🔁", layout="wide")
 
 st.title("🔁 Auto-correction des prédictions")
 st.caption(
