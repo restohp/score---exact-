@@ -83,16 +83,17 @@ def _fit_lines(draw, text, max_w, start, minimum=28):
 # ----------------------------------------------------------------------
 # Calculs du modèle
 # ----------------------------------------------------------------------
-def _share(stats):
-    """Part des buts en 1re mi-temps : moyenne des deux équipes, ramenée vers 45 %
-    (20 « buts fictifs ») pour éviter les valeurs extrêmes sur 10 matchs."""
+def _share(stats, prior=HALF_SHARE):
+    """Part des buts en 1re mi-temps : moyenne des deux équipes, ramenée vers `prior`
+    (45 % par défaut, ou la part réelle du championnat si l'auto-correction est active)
+    avec 20 « buts fictifs » pour éviter les valeurs extrêmes sur 10 matchs."""
     if not stats or not stats[0] or not stats[1]:
-        return HALF_SHARE
+        return prior
     out = []
     for st in stats:
         g1 = st["n"] * (st["f1"] + st["a1"])
         g2 = st["n"] * (st["f2"] + st["a2"])
-        out.append((g1 + HALF_SHARE * 20) / (g1 + g2 + 20))
+        out.append((g1 + prior * 20) / (g1 + g2 + 20))
     return float(np.mean(out))
 
 
@@ -108,17 +109,21 @@ def half_scores(i, j, share):
     return (h1, a1), (i - h1, j - a1)
 
 
-def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=None):
-    """Étiquettes et probabilités d'un match, + validation si le score est connu.
-
-    stats : (moyennes équipe domicile, moyennes équipe extérieur) par mi-temps, ou None.
-    """
-    m = model.score_matrix(home, away)
+def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=None, calib=None):
+    """Étiquettes et probabilités d'un match, + validation si le score est connu."""
+    if calib is not None:
+        import calib_core as cb
+        m = cb.adjusted_matrix(model, home, away, calib)   # correction par équipe si activée
+    else:
+        m = model.score_matrix(home, away)
     n = m.shape[0]
     total_goals = np.add.outer(np.arange(n), np.arange(n))
     p_over15 = float(m[total_goals >= 2].sum())
     p_btts = float(1 - m[0, :].sum() - m[:, 0].sum() + m[0, 0])
     p1x2 = DixonColes.probs_1x2(m)
+    if calib is not None:                      # auto-correction apprise sur les erreurs passées
+        import calib_core as cb
+        p1x2, p_over15, p_btts = cb.correct(p1x2, p_over15, p_btts, calib)
     pick = int(np.argmax(p1x2))
     # score le plus probable PARMI ceux qui correspondent au pronostic 1/N/2
     ii, jj = np.indices(m.shape)
@@ -155,7 +160,8 @@ def build_match(model, home, away, league, date_str, hg=None, ag=None, stats=Non
         "league": league, "date": date_str, "home": home, "away": away,
         "hg": hg, "ag": ag, "tags": tags, "score_pred": f"{i}-{j}",
         "half": stats if (stats and stats[0] and stats[1]) else None,
-        "half_score": None if played else half_scores(int(i), int(j), _share(stats)),
+        "half_score": None if played else half_scores(
+            int(i), int(j), _share(stats, (calib or {}).get("share", HALF_SHARE))),
     }
 
 
