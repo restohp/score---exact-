@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 
 import calendrier_core as cc
+import calib_store as store
 import cartes_core as cr
 import dixon_coles as dc
 import half_stats as hs
@@ -110,6 +111,11 @@ title = st.text_input("Titre", value=f"Pronostics du {cc.fr_date(day_ts)}", key=
 signature = st.text_input("Ta signature (pseudo, optionnel)", value="", key="car_sig")
 show_prob = st.checkbox("Afficher les pourcentages", value=True, key="car_prob")
 show_half = st.checkbox("Afficher les buts par mi-temps", value=True, key="car_half")
+use_calib = st.checkbox(
+    "Auto-correction des probabilités (seulement les corrections qui ont fait leurs preuves "
+    "dans ce championnat)",
+    value=False, key="car_calib",
+)
 
 if st.button("Créer la carte", type="primary", use_container_width=True):
     if not choix:
@@ -120,12 +126,19 @@ if st.button("Créer la carte", type="primary", use_container_width=True):
             r = rows[labels.index(lab)]
             df = history(r["code"])
             model = model_for(r["code"], str(cc.cutoff_for(df, day_ts).date()))
+            cal = None
+            if use_calib:
+                try:
+                    with st.spinner(f"Auto-correction : {r['ligue']}..."):
+                        cal = store.calibration(r["code"])
+                except Exception as exc:
+                    st.caption(f"Auto-correction indisponible pour {r['ligue']} ({exc}).")
             hd = half_df(r["code"])
             stats = (hs.averages(hd, r["home"], r["date"]),
                      hs.averages(hd, r["away"], r["date"]))
             matches.append(cr.build_match(
                 model, r["home"], r["away"], r["ligue"], cc.fr_date(r["date"]),
-                r["hg"], r["ag"], stats=stats,
+                r["hg"], r["ag"], stats=stats, calib=cal,
             ))
         st.session_state["car_png"] = cr.render_card(matches, title, signature, show_prob, show_half)
 
