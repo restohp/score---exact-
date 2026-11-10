@@ -230,16 +230,23 @@ with tab_eval:
 
     st.markdown("**Correction finale utilisée sur les cartes**")
     full = store.calibration(code)
+    used = full.get("used", {})
     a, bn, b2 = full["x12"]
-    st.write(f"- 1/N/2 : température {a:.2f} (1 = aucune), biais sur le nul {bn:+.2f}, "
-             f"sur la victoire extérieur {b2:+.2f}.")
-    st.write(f"- +1,5 but : pente {full['o15'][0]:.2f}, décalage {full['o15'][1]:+.2f}.")
-    st.write(f"- Les deux marquent : pente {full['gg'][0]:.2f}, décalage {full['gg'][1]:+.2f}.")
-    st.write(f"- Part des buts en 1re mi-temps : {full['share']:.1%}.")
+    st.write(("- 1/N/2 : correction utilisée " if used.get("x12") else "- 1/N/2 : non utilisée ")
+             + (f"(température {a:.2f}, biais nul {bn:+.2f}, extérieur {b2:+.2f})."
+                if used.get("x12") else "(elle n'améliore pas nettement)."))
+    st.write(("- +1,5 but : correction utilisée " if used.get("o15") else "- +1,5 but : non utilisée ")
+             + (f"(pente {full['o15'][0]:.2f}, décalage {full['o15'][1]:+.2f})."
+                if used.get("o15") else "(elle n'améliore pas nettement)."))
+    st.write(("- Les deux marquent : correction utilisée " if used.get("gg") else "- Les deux marquent : non utilisée ")
+             + (f"(pente {full['gg'][0]:.2f}, décalage {full['gg'][1]:+.2f})."
+                if used.get("gg") else "(elle n'améliore pas nettement)."))
+    st.write(f"- Part des buts en 1re mi-temps du championnat : {full['share']:.1%}.")
     if full.get("team"):
         st.write("- Correction par équipe : activée. Équipes les plus modifiées (en % de buts) :")
         ft = cb.team_factors_table(full["team"]).round(1)
         st.dataframe(ft, hide_index=True, use_container_width=True)
     else:
         st.write("- Correction par équipe : non activée (elle n'a pas passé le test).")
-    st.caption("Sur la page « cartes », la case « Auto-correction » applique cette correction.")
+    st.caption("Sur la page « cartes », la case « Auto-correction » applique seulement les "
+               "corrections marquées « utilisée ». Les autres pourcentages restent ceux du modèle.")
