@@ -209,6 +209,8 @@ def fit_full(P):
     - la correction par équipe n'est activée que si elle améliore nettement (z < -2) sur des
       matchs qu'elle n'a pas vus ;
     - la correction globale est apprise ensuite sur les probabilités déjà corrigées par équipe ;
+    - chaque correction globale (1/N/2, +1,5 but, GG) n'est gardée que si elle a nettement
+      amélioré le test ; sinon elle est remplacée par « aucune correction » ;
     - la part de buts en 1re mi-temps est celle observée dans le championnat.
     """
     try:
@@ -219,6 +221,22 @@ def fit_full(P):
     team = fit_team(P) if use_team else None
     P2 = adjust_rates(P, team) if use_team else P
     cal = fit_calibration(P2)
+    neutral = {"x12": (1.0, 0.0, 0.0), "o15": (1.0, 0.0), "gg": (1.0, 0.0)}
+    keys = {"Résultat 1/N/2": "x12", "+1,5 but": "o15", "Les deux marquent": "gg"}
+    used = {"x12": False, "o15": False, "gg": False}
+    try:
+        res = evaluate(P2)[0]
+        for _, r in res.iterrows():
+            k = keys[r["Marché"]]
+            z = r["z (négatif = mieux)"]
+            if np.isfinite(z) and z < -2.0:
+                used[k] = True
+    except Exception:
+        pass
+    for k, ok in used.items():
+        if not ok:
+            cal[k] = neutral[k]
+    cal["used"] = used
     cal["team"] = team
     cal["z_team"] = z_all
     cal["share"] = league_share(P)
