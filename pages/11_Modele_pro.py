@@ -94,11 +94,11 @@ used = cal.get("used", {})
 st.subheader(f"{LEAGUES[code_run]} : ce que le modèle pro utilise")
 z = info["z_shots"]
 if info["cov"] < 0.7:
-    shots_txt = "non : pas assez de données de tirs dans les fichiers gratuits"
+    shots_txt = "non (pas assez de données de tirs)"
 elif info["w"] < 1.0:
-    shots_txt = f"oui (mélange 50 % buts, 50 % tirs ; z {z:+.2f} contre les buts seuls, négatif = mieux)"
+    shots_txt = "oui (50 % buts, 50 % tirs)"
 else:
-    shots_txt = f"non : le test les trouve nettement moins bons ici (z {z:+.2f})"
+    shots_txt = "non (nettement moins bons ici)"
 rows = [
     ("Force des équipes avec les tirs", shots_txt),
     ("Correction du 1/N/2", "oui" if used.get("x12") else "non (elle n'améliore pas nettement)"),
@@ -110,6 +110,17 @@ rows = [
 ]
 st.dataframe(pd.DataFrame(rows, columns=["Amélioration", "Utilisée ?"]), hide_index=True,
              use_container_width=True)
+if info["cov"] >= 0.7 and np.isfinite(z):
+    if z < -2:
+        verdict = "amélioration nette"
+    elif z < 0:
+        verdict = "amélioration probable, pas encore prouvée"
+    elif z <= 2:
+        verdict = "aucune différence visible"
+    else:
+        verdict = "moins bon que les buts seuls"
+    st.markdown(f"**z des tirs : {z:+.2f}** → {verdict}. "
+                "(En dessous de -2 = amélioration nette ; au-dessus de +2 = dégradation.)")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Modèle actuel (buts seuls)", f"{info['ll_goals']:.4f}")
