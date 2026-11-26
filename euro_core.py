@@ -8,6 +8,7 @@ Ce modèle ne peut pas être validé sur des matchs de coupe passés : estimatio
 """
 import difflib
 import io
+import os
 import re
 import unicodedata
 
@@ -17,7 +18,6 @@ import requests
 from scipy.optimize import brentq
 from scipy.stats import poisson
 
-CLUBELO = "https://api.clubelo.com/{d}"
 FD_EXTRA = "https://www.football-data.co.uk/new/{c}.csv"
 
 # pays ClubElo -> championnat football-data principal (déjà dans l'appli)
@@ -34,16 +34,43 @@ SHRINK = 10.0          # nombre de matchs « neutres » ajoutés pour stabiliser
 MAXG = 10
 
 
-def fetch_elo(day=None):
-    """Classement Elo de tous les clubs européens (DataFrame Club, Country, Level, Elo)."""
-    d = pd.Timestamp(day or pd.Timestamp.today()).strftime("%Y-%m-%d")
-    r = requests.get(CLUBELO.format(d=d), timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
+def _parse_elo(text):
+    df = pd.read_csv(io.StringIO(text))
     df = df.dropna(subset=["Club", "Elo"])
     df["Elo"] = pd.to_numeric(df["Elo"], errors="coerce")
     df["Level"] = pd.to_numeric(df["Level"], errors="coerce")
-    return df.dropna(subset=["Elo"]).sort_values("Elo", ascending=False).reset_index(drop=True)
+    df = df.dropna(subset=["Elo"]).sort_values("Elo", ascending=False).reset_index(drop=True)
+    if df.empty:
+        raise ValueError("classement vide")
+    return df
+
+
+def fetch_elo(day=None, cache="data"):
+    """Classement Elo de tous les clubs européens (DataFrame Club, Country, Level, Elo).
+
+    Essaie http puis https, aujourd'hui puis les 2 jours d'avant ; garde une copie sur disque
+    et la réutilise si le site ne répond pas.
+    """
+    os.makedirs(cache, exist_ok=True)
+    path = f"{cache}/clubelo.csv"
+    base = pd.Timestamp(day or pd.Timestamp.today())
+    last = None
+    for back in (0, 1, 2):
+        d = (base - pd.Timedelta(days=back)).strftime("%Y-%m-%d")
+        for scheme in ("http", "https"):
+            try:
+                r = requests.get(f"{scheme}://api.clubelo.com/{d}", timeout=(8, 25),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                df = _parse_elo(r.text)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(r.text)
+                return df
+            except Exception as exc:
+                last = exc
+    if os.path.exists(path):
+        return _parse_elo(open(path, encoding="utf-8").read())
+    raise RuntimeError(f"clubelo.com ne répond pas ({type(last).__name__})")
 
 
 def _norm(s):
