@@ -8,6 +8,7 @@ Ce modèle ne peut pas être validé sur des matchs de coupe passés : estimatio
 """
 import difflib
 import io
+import logging
 import os
 import re
 import unicodedata
@@ -17,6 +18,8 @@ import pandas as pd
 import requests
 from scipy.optimize import brentq
 from scipy.stats import poisson
+
+log = logging.getLogger(__name__)
 
 FD_EXTRA = "https://www.football-data.co.uk/new/{c}.csv"
 
@@ -33,7 +36,13 @@ RHO = -0.06            # correction des petits scores (Dixon-Coles)
 SHRINK = 10.0          # nombre de matchs « neutres » ajoutés pour stabiliser le style de jeu
 MAXG = 10
 
+ELO_TIMEOUT = (10, 30)  # (connexion, lecture) en secondes
+UA = {"User-Agent": "Mozilla/5.0"}
 
+
+# ---------------------------------------------------------------------------
+# Elo
+# ---------------------------------------------------------------------------
 def _parse_elo(text):
     df = pd.read_csv(io.StringIO(text))
     df = df.dropna(subset=["Club", "Elo"])
@@ -48,52 +57,90 @@ def _parse_elo(text):
 def fetch_elo(day=None, cache="data"):
     """Classement Elo de tous les clubs européens (DataFrame Club, Country, Level, Elo).
 
-    Essaie http puis https, aujourd'hui puis les 2 jours d'avant ; garde une copie sur disque
-    et la réutilise si le site ne répond pas.
+    1. Essaie clubelo.com (https puis http, aujourd'hui puis les 2 jours d'avant).
+    2. Si le site est injoignable, utilise la copie data/clubelo.csv (celle du dépôt
+       ou celle téléchargée la dernière fois).
+    df.attrs["source"] indique d'où viennent les données.
     """
     os.makedirs(cache, exist_ok=True)
     path = f"{cache}/clubelo.csv"
     base = pd.Timestamp(day or pd.Timestamp.today())
     last = None
+    unreachable = False
+
     for back in (0, 1, 2):
         d = (base - pd.Timedelta(days=back)).strftime("%Y-%m-%d")
-        for scheme in ("http", "https"):
+        for scheme in ("https", "http"):
             try:
-                r = requests.get(f"{scheme}://api.clubelo.com/{d}", timeout=(8, 25),
-                                 headers={"User-Agent": "Mozilla/5.0"})
+                r = requests.get(f"{scheme}://api.clubelo.com/{d}",
+                                 timeout=ELO_TIMEOUT, headers=UA)
                 r.raise_for_status()
                 df = _parse_elo(r.text)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(r.text)
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(r.text)
+                except OSError:
+                    pass  # disque en lecture seule : sans importance
+                df.attrs["source"] = f"clubelo.com ({d})"
                 return df
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as exc:
+                last = exc
+                unreachable = True
             except Exception as exc:
                 last = exc
+        if unreachable:
+            break  # site injoignable : inutile d'essayer d'autres dates
+
     if os.path.exists(path):
-        return _parse_elo(open(path, encoding="utf-8").read())
-    raise RuntimeError(f"clubelo.com ne répond pas ({type(last).__name__})")
+        df = _parse_elo(open(path, encoding="utf-8").read())
+        age = pd.Timestamp.today() - pd.Timestamp(os.path.getmtime(path), unit="s")
+        df.attrs["source"] = f"copie locale (vieille de {age.days} j)"
+        log.warning("clubelo.com injoignable (%s) : copie locale utilisée", type(last).__name__)
+        return df
+
+    raise RuntimeError(f"clubelo.com ne répond pas ({type(last).__name__}) "
+                       f"et aucune copie locale dans {path}")
+
+
+# ---------------------------------------------------------------------------
+# Rapprochement des noms de clubs
+# ---------------------------------------------------------------------------
+_STOP = {"fc", "sc", "fk", "sk", "cf", "ac", "as", "ssc", "afc", "bk", "if", "ff",
+         "sv", "vfb", "vfl", "rb", "ud", "cd", "sd", "cfr", "ca"}
 
 
 def _norm(s):
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
-    s = re.sub(r"\b(fc|sc|fk|sk|cf|ac|as|ssc|afc|bk|if|ff|sv|vfb|vfl|rb|ud|cd|sd|fc|cfr|ca)\b", " ", s)
-    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(w for w in s.split() if w not in _STOP)
 
 
 def match_team(name, candidates):
     """Nom ClubElo -> nom exact dans le fichier de la ligue, ou None si introuvable."""
-    cands = {_norm(c): c for c in candidates}
+    cands = {}
+    for c in candidates:
+        cands.setdefault(_norm(c), c)
     n = _norm(name)
     if not n:
         return None
     if n in cands:
         return cands[n]
-    for k, v in cands.items():                      # inclusion (« kairat » dans « kairat almaty »)
-        if len(n) >= 4 and (n in k or k in n) and min(len(n), len(k)) >= 4:
-            return v
-    best = difflib.get_close_matches(n, list(cands), n=1, cutoff=0.78)
+
+    # inclusion par mots entiers (« kairat » dans « kairat almaty »), un seul candidat possible
+    nw = set(n.split())
+    hits = [v for k, v in cands.items()
+            if k and (nw <= set(k.split()) or set(k.split()) <= nw)
+            and min(len(n), len(k)) >= 4]
+    if len(hits) == 1:
+        return hits[0]
+
+    best = difflib.get_close_matches(n, list(cands), n=1, cutoff=0.8)
     return cands[best[0]] if best else None
 
 
+# ---------------------------------------------------------------------------
+# Style de jeu par la ligue d'origine
+# ---------------------------------------------------------------------------
 def fetch_league_games(country):
     """Matchs récents (1 an) du championnat d'un pays : DataFrame Date, home, away, hg, ag. None si indisponible."""
     try:
@@ -102,7 +149,7 @@ def fetch_league_games(country):
             d = dc.load_league(COUNTRY_MAIN[country], n_seasons=2)
             g = d.rename(columns={"HomeTeam": "home", "AwayTeam": "away", "FTHG": "hg", "FTAG": "ag"})
         elif country in COUNTRY_EXTRA:
-            r = requests.get(FD_EXTRA.format(c=COUNTRY_EXTRA[country]), timeout=30)
+            r = requests.get(FD_EXTRA.format(c=COUNTRY_EXTRA[country]), timeout=30, headers=UA)
             r.raise_for_status()
             raw = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig", errors="replace")))
             raw.columns = [str(c).strip() for c in raw.columns]
@@ -116,7 +163,8 @@ def fetch_league_games(country):
         g = g.dropna()
         g = g[g["Date"] >= g["Date"].max() - pd.Timedelta(days=365)]
         return g.reset_index(drop=True) if len(g) >= 30 else None
-    except Exception:
+    except Exception as exc:
+        log.warning("ligue %s indisponible : %s: %s", country, type(exc).__name__, exc)
         return None
 
 
@@ -134,6 +182,9 @@ def team_style(games, team_in_data):
     return float((n * raw + SHRINK * 1.0) / (n + SHRINK)), int(n), float(avg)
 
 
+# ---------------------------------------------------------------------------
+# Modèle de scores
+# ---------------------------------------------------------------------------
 def _matrix(lh, la):
     ph, pa = poisson.pmf(np.arange(MAXG + 1), lh), poisson.pmf(np.arange(MAXG + 1), la)
     m = np.outer(ph, pa)
